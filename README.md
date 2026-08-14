@@ -1,42 +1,53 @@
 # simple-tag-objectives
 
+Minimal JaxMARL **environment** + **Part 1 opponent modeling** scaffold
+(GRU-JEPA / VAE, soft beliefs, latent-conditioned BC) and a slimmed **MAPPO**
+trainer for objective-typed specialists.
+
+- Env contract: [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md)
+- Part 1 vision + metrics: [`docs/PART1.md`](docs/PART1.md)
 
 ## Install
-
-JaxMARL is required and is not on PyPI as a first-class dep here — install it
-editable from a local checkout (or your preferred source):
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -e /path/to/JaxMARL
-pip install -e ".[dev]"
+pip install -e ".[dev,train]"
 ```
 
-## Quick start
+## Environment quick start
 
 ```python
 import jax
 from tag_objectives import make_env, evaluate_policy, random_policy
 
-env = make_env("curious")  # or "capture" / "risk" / any registered name
+env = make_env("curious")
 metrics = evaluate_policy(
     env, random_policy(env), n_eps=64, key=jax.random.PRNGKey(0)
 )
 print(metrics.means())
 ```
 
+## Train MAPPO specialists
+
+```bash
+python scripts/train_mappo.py alg=mappo_objectives_capture NUM_SEEDS=3
+python scripts/train_mappo.py alg=mappo_objectives_risk NUM_SEEDS=3
+python scripts/train_mappo.py alg=mappo_objectives_curious NUM_SEEDS=3
+```
+
+Checkpoints land under `logs/MPE_simple_tag_v3/`.
+
 ## Layout
 
 ```text
-src/tag_objectives/
-  resources.py    # SimpleTagResourcesMPE
-  objectives.py   # SimpleTagObjectivesMPE + objective registry
-  api.py          # make_env / evaluate_policy / random_policy
-  types.py        # EpisodeMetrics
-  teams.py        # freeze helpers for batched eval
-tests/            # golden rewards + API contract
-docs/ENVIRONMENT.md
+src/tag_objectives/   # env
+src/mopa/             # Part 1: encoders, belief, bc, data, metrics
+scripts/train_mappo.py
+configs/alg/mappo_objectives_{capture,risk,curious}.yaml
+docs/{ENVIRONMENT,PART1}.md
+tests/
 ```
 
 ## Test

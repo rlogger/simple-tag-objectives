@@ -1,3 +1,7 @@
+logs/
+plots/
+*.npz
+*.safetensors
 .venv/
 __pycache__/
 *.py[cod]
@@ -9,9 +13,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 .DS_Store
-*.npz
-*.safetensors
-logs/
-plots/
 .idea/
 .vscode/
+outputs/
+multirun/

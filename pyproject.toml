@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "simple-tag-objectives"
 version = "0.1.0"
-description = "Objective-typed predator-prey environment on JaxMARL simple-tag (resources, lava, pluggable predator objectives)."
+description = "Objective-typed predator-prey env + Part 1 opponent modeling (GRU-JEPA, belief, BC) and MAPPO specialists."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -13,10 +13,19 @@ dependencies = [
     "jax",
     "flax",
     "chex",
+    "optax",
+    "scikit-learn",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+train = [
+    "hydra-core",
+    "omegaconf",
+    "distrax",
+    "wandb",
+    "safetensors",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,0 +1,16 @@
+defaults:
+  - alg: mappo_objectives_capture
+  - _self_
+
+# experiment params
+NUM_SEEDS: 1
+SEED: 0
+
+# wandb params
+ENTITY: ""
+PROJECT: "simple-tag-objectives"
+WANDB_MODE: "disabled"
+WANDB_LOG_ALL_SEEDS: False
+
+# where to save the params
+SAVE_PATH: "logs"
