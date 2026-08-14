@@ -1,15 +1,5 @@
 # opponent-modeling
 
-Objective-typed predator–prey environment and Part 1 opponent-modeling
-scaffold (GRU-JEPA / VAE, soft beliefs, latent-conditioned BC), plus a slimmed
-MAPPO trainer for specialists.
-
-Packages: `tag_objectives` (env), `mopa` (Part 1 + data/metrics/BC).
-
-- Env: [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md)
-- Part 1: [`docs/PART1.md`](docs/PART1.md)
-- Slides: [`docs/presentation-part1.html`](docs/presentation-part1.html)
-
 ## Install
 
 ```bash
