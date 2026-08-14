@@ -1,11 +1,5 @@
 # simple-tag-objectives
 
-Minimal JaxMARL environment: objective-typed predators vs one prey, with
-resources and lava. Extracted and cleaned from
-[marl-opp-aware](https://github.com/rlogger/marl-opp-aware) — env + scaffold
-only, no trainers, checkpoints, or paper artifacts.
-
-See [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md) for the contract.
 
 ## Install
 
