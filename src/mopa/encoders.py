@@ -1,39 +1,28 @@
 """Self-supervised opponent-trajectory encoders: VAE (reconstruct) vs JEPA
-(predict the future's representation).
+(predict a future prefix's representation).
 
-Generalised from the validated hidden-intent study
-(src/jepa_vs_vae_encoder.py) to any window sizes and label cardinality, with
-the two protocol upgrades the audit called for:
+Protocol upgrades for Part 1 foundation:
 
-  * multi-seed: every reported number is mean +/- std over ENCODER training
-    seeds (default 3), not a single PRNGKey(0) point estimate;
-  * the probe is cross-validated at the trajectory level (one sample per
-    episode), so there is no pooled-timestep leakage.
+  * multi-seed reporting;
+  * GRU encoder with length/pad masking;
+  * unit-sphere latents + L2-on-normalized prediction (no VICReg);
+  * online encode API returning frozen params;
+  * collapse diagnostics (across-episode std, effective rank).
 
-The JEPA training procedure follows the 2026-07-31 "Thoughts on Latent
-Strategy Modeling" review:
-
-  1. GRU-based encoder (``GRUEnc`` / ``train_jepa_gru``) for variable-length
-     sequences, so an episode can be encoded "so far" at any step and full
-     100-step episodes are no longer truncated to a fixed window;
-  2. L2 norm (not L1) for the latent prediction loss;
-  3. no VICReg variance penalty -- it pushes latents apart and conflicts with
-     JEPA on correlated RL batches;
-  4. LayerNorm (never BatchNorm) inside the encoders to prevent collapse:
-     LayerNorm normalizes per trajectory, so context and target windows with
-     different distributions do not contaminate each other's statistics.
-
-The old study scripts under ``src/`` keep their own frozen copies of the
-pre-review loss so their published numbers stay reproducible.
+Labels remain evaluation-only for the primary SSL path.
 """
-import numpy as np
+from __future__ import annotations
+
+from typing import Any
+
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
-from flax.linen.initializers import orthogonal
+import numpy as np
 import optax
+from flax.linen.initializers import orthogonal
 
-from mopa.metrics import metrics, oracle_acc, probe_acc  # noqa: F401 — re-export
+from mopa.metrics import metrics  # noqa: F401 — re-export
 
 HID = 64
 STEPS = 5000
@@ -42,9 +31,7 @@ EMA = 0.996
 
 
 class Enc(nn.Module):
-    """MLP context encoder with LayerNorm on the hidden layers (anti-collapse:
-    if activations head toward a constant, the per-trajectory variance in the
-    norm's denominator shrinks and gradients grow, pushing the network back)."""
+    """MLP context encoder with LayerNorm on the hidden layers."""
 
     lat: int = 2
 
@@ -62,7 +49,7 @@ class EncVAE(nn.Module):
     def __call__(self, x):
         x = nn.relu(nn.Dense(HID, kernel_init=orthogonal(np.sqrt(2)))(x))
         x = nn.relu(nn.Dense(HID, kernel_init=orthogonal(np.sqrt(2)))(x))
-        return nn.Dense(self.lat)(x), nn.Dense(self.lat)(x)   # mu, logvar
+        return nn.Dense(self.lat)(x), nn.Dense(self.lat)(x)  # mu, logvar
 
 
 class Dec(nn.Module):
@@ -89,8 +76,8 @@ class GRUEnc(nn.Module):
 
     Takes padded sequences ``x`` of shape ``(N, T, F)`` and returns per-prefix
     latents of shape ``(N, T, lat)``: output ``[:, k - 1]`` encodes the first
-    ``k`` steps. LayerNorm on the input projection and recurrent states
-    prevents collapse.
+    ``k`` steps. When ``lengths`` is provided, timesteps ``t >= lengths[i]``
+    freeze the hidden state (pad-safe).
 
     Hand-rolled GRU (explicit kernels + ``lax.scan``) avoids Flax ``nn.RNN`` /
     ``nn.scan`` APIs that require newer JAX than JaxMARL currently pins.
@@ -100,14 +87,13 @@ class GRUEnc(nn.Module):
     hid: int = HID
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, lengths=None):
         # x: (N, T, F)
         x = nn.relu(
             nn.LayerNorm()(
                 nn.Dense(self.hid, kernel_init=orthogonal(np.sqrt(2)))(x)
             )
         )
-        # Explicit kernels so the scan body is pure jnp (no Module.param inside).
         wz = self.param("wz", orthogonal(np.sqrt(2)), (self.hid, self.hid))
         bz = self.param("bz", nn.initializers.zeros, (self.hid,))
         wr = self.param("wr", orthogonal(np.sqrt(2)), (self.hid, self.hid))
@@ -118,19 +104,80 @@ class GRUEnc(nn.Module):
         ur = self.param("ur", orthogonal(np.sqrt(2)), (self.hid, self.hid))
         uh = self.param("uh", orthogonal(np.sqrt(2)), (self.hid, self.hid))
 
-        def step(h, xt):
+        n, t_max, _ = x.shape
+        if lengths is None:
+            valid = jnp.ones((n, t_max), dtype=bool)
+        else:
+            lens = jnp.asarray(lengths, dtype=jnp.int32)
+            valid = jnp.arange(t_max)[None, :] < lens[:, None]
+
+        def step(h, inputs):
+            xt, step_valid = inputs
             z = jax.nn.sigmoid(xt @ wz + h @ uz + bz)
             r = jax.nn.sigmoid(xt @ wr + h @ ur + br)
-            n = jnp.tanh(xt @ wh + (r * h) @ uh + bh)
-            h_new = (1.0 - z) * n + z * h
-            return h_new, h_new
+            nh = jnp.tanh(xt @ wh + (r * h) @ uh + bh)
+            h_new = (1.0 - z) * nh + z * h
+            h_out = jnp.where(step_valid[:, None], h_new, h)
+            return h_out, h_out
 
-        h0 = jnp.zeros((x.shape[0], self.hid), dtype=x.dtype)
+        h0 = jnp.zeros((n, self.hid), dtype=x.dtype)
         x_t = jnp.swapaxes(x, 0, 1)  # (T, N, H)
-        _, h_t = jax.lax.scan(step, h0, x_t)
+        valid_t = jnp.swapaxes(valid, 0, 1)  # (T, N)
+        _, h_t = jax.lax.scan(step, h0, (x_t, valid_t))
         h = jnp.swapaxes(h_t, 0, 1)  # (N, T, H)
         h = nn.LayerNorm()(h)
         return nn.Dense(self.lat, kernel_init=orthogonal(1.0))(h)
+
+
+def unit_normalize(z):
+    """Map trajectory embeddings to the unit sphere for stable JEPA training."""
+    return z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-6)
+
+
+def latent_std_diagnostics(z: np.ndarray) -> dict[str, np.ndarray | float]:
+    """Across-episode / per-dimension std and mean L2 norm of latents."""
+    z = np.asarray(z, dtype=np.float32)
+    if z.ndim != 2:
+        raise ValueError(f"expected z shape (N, lat), got {z.shape}")
+    per_dim = z.std(axis=0)
+    return {
+        "per_dim_std": per_dim.astype(np.float32),
+        "across_std_mean": float(per_dim.mean()),
+        "mean_norm": float(np.linalg.norm(z, axis=-1).mean()),
+    }
+
+
+def effective_rank(z: np.ndarray, eps: float = 1e-12) -> float:
+    """Participation-ratio effective rank of centered latents."""
+    z = np.asarray(z, dtype=np.float32)
+    if z.ndim != 2 or z.shape[0] < 2:
+        return 0.0
+    zc = z - z.mean(axis=0, keepdims=True)
+    s = np.linalg.svd(zc, compute_uv=False)
+    p = s**2
+    total = float(p.sum())
+    if total < eps:
+        return 1.0  # collapsed / near-constant → rank 1
+    p = p / total
+    return float(1.0 / ((p**2).sum() + eps))
+
+
+def collapse_diagnostics(z: np.ndarray) -> dict[str, float]:
+    """Compact collapse summary for episode-level latents ``(N, lat)``."""
+    stats = latent_std_diagnostics(z)
+    return {
+        "across_std_mean": float(stats["across_std_mean"]),
+        "mean_norm": float(stats["mean_norm"]),
+        "effective_rank": effective_rank(z),
+    }
+
+
+def gather_prefix_latents(z: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Select ``z[i, lengths[i] - 1]`` for each episode."""
+    z = np.asarray(z)
+    lengths = np.asarray(lengths, dtype=np.int32)
+    idx = np.clip(lengths - 1, 0, z.shape[1] - 1)
+    return z[np.arange(len(z)), idx]
 
 
 def train_vae(Xc, rng, lat=2, steps=STEPS):
@@ -147,7 +194,7 @@ def train_vae(Xc, rng, lat=2, steps=STEPS):
         mu, lv = enc.apply(p["e"], x)
         z = mu + jnp.exp(0.5 * lv) * jax.random.normal(rng, mu.shape)
         rec = jnp.mean(jnp.sum((dec.apply(p["d"], z) - x) ** 2, -1))
-        kl = jnp.mean(-0.5 * jnp.sum(1 + lv - mu ** 2 - jnp.exp(lv), -1))
+        kl = jnp.mean(-0.5 * jnp.sum(1 + lv - mu**2 - jnp.exp(lv), -1))
         return rec + beta * kl
 
     @jax.jit
@@ -165,8 +212,7 @@ def train_vae(Xc, rng, lat=2, steps=STEPS):
 
 def train_jepa(Xc, Xt, rng, lat=2, steps=STEPS):
     """Predict the EMA-target representation of the target window from the
-    context window. L2 prediction loss; collapse is prevented by the LayerNorm
-    encoders + EMA target (no VICReg term). Returns z (N, lat)."""
+    context window. Unit-sphere L2 prediction; no VICReg. Returns z (N, lat)."""
     enc, pred = Enc(lat=lat), Pred(lat=lat)
     rng, ke, kp = jax.random.split(rng, 3)
     params = {"e": enc.init(ke, Xc[:1]), "p": pred.init(kp, jnp.zeros((1, lat)))}
@@ -177,9 +223,9 @@ def train_jepa(Xc, Xt, rng, lat=2, steps=STEPS):
     n = len(Xc)
 
     def loss_fn(p, tgt, xc, xt):
-        z = enc.apply(p["e"], xc)
-        pz = pred.apply(p["p"], z)
-        t = jax.lax.stop_gradient(enc.apply(tgt, xt))
+        z = unit_normalize(enc.apply(p["e"], xc))
+        pz = unit_normalize(pred.apply(p["p"], z))
+        t = jax.lax.stop_gradient(unit_normalize(enc.apply(tgt, xt)))
         return jnp.mean((pz - t) ** 2)
 
     @jax.jit
@@ -187,77 +233,134 @@ def train_jepa(Xc, Xt, rng, lat=2, steps=STEPS):
         g = jax.grad(loss_fn)(params, target, Xcj[idx], Xtj[idx])
         u, opt = tx.update(g, opt)
         params = optax.apply_updates(params, u)
-        target = jax.tree_util.tree_map(lambda a, b: EMA * a + (1 - EMA) * b,
-                                        target, params["e"])
+        target = jax.tree_util.tree_map(
+            lambda a, b: EMA * a + (1 - EMA) * b, target, params["e"]
+        )
         return params, target, opt
 
     for s in range(steps):
         rng, bk = jax.random.split(rng)
         idx = jax.random.choice(bk, n, (min(BATCH, n),), replace=False)
         params, target, opt = upd(params, target, opt, idx)
-    return np.asarray(enc.apply(params["e"], Xcj))
+    return np.asarray(unit_normalize(enc.apply(params["e"], Xcj)))
 
 
-def train_jepa_gru(X, lengths, rng, lat=2, hid=HID, steps=STEPS, tmin=3):
-    """Variable-length JEPA with a GRU encoder.
+def train_jepa_gru_with_params(
+    X,
+    lengths,
+    rng,
+    lat=2,
+    hid=HID,
+    steps=STEPS,
+    tmin=3,
+    target_mode: str = "later_prefix",
+):
+    """Variable-length JEPA with a pad-masked GRU encoder.
 
-    ``X`` is a zero-padded batch of sequences ``(N, T, F)`` and ``lengths``
-    gives each episode's true number of valid steps (``1..T``). Every training
-    step samples a per-episode context length ``t in [tmin, len)``; the
-    predictor must map the online encoding of the first ``t`` steps to the
-    EMA-target encoding of the full episode (all ``len`` steps), so it has to
-    anticipate the representation of the not-yet-observed future. L2 loss, no
-    VICReg; LayerNorm inside ``GRUEnc`` guards against collapse.
+    ``X`` is zero-padded ``(N, T, F)``; ``lengths`` gives each episode's true
+    valid step count (``1..T``). Online / predicted / EMA-target latents are
+    unit-normalized; loss is L2 on the sphere (no VICReg).
 
-    Returns per-prefix latents ``z`` of shape ``(N, T, lat)`` from the trained
-    online encoder; ``z[:, k - 1]`` encodes the first ``k`` steps, and
-    ``z[arange(N), lengths - 1]`` is the full-episode embedding.
+    ``target_mode``:
+      * ``"later_prefix"`` (default): sample ``t_tgt ∈ (t_ctx, t_full]``
+      * ``"full"``: always predict the full-episode embedding at ``t_full``
+
+    Returns ``(z, online_params, target_ema)`` where ``z`` has shape
+    ``(N, T, lat)``.
     """
+    if target_mode not in ("later_prefix", "full"):
+        raise ValueError(f"unknown target_mode={target_mode!r}")
+
     enc, pred = GRUEnc(lat=lat, hid=hid), Pred(lat=lat)
     rng, ke, kp = jax.random.split(rng, 3)
-    params = {"e": enc.init(ke, X[:1]), "p": pred.init(kp, jnp.zeros((1, lat)))}
+    lengths_np = np.asarray(lengths, dtype=np.int32)
+    params = {
+        "e": enc.init(ke, X[:1], lengths_np[:1]),
+        "p": pred.init(kp, jnp.zeros((1, lat))),
+    }
     target = params["e"]
     tx = optax.adam(1e-3)
     opt = tx.init(params)
     Xj = jnp.asarray(X)
     lens = jnp.clip(jnp.asarray(lengths, jnp.int32), tmin + 1, X.shape[1])
     n = len(X)
+    use_full = target_mode == "full"
 
-    def loss_fn(p, tgt, x, t_ctx, t_full):
-        zs = enc.apply(p["e"], x)
-        z_ctx = zs[jnp.arange(len(x)), t_ctx - 1]
-        pz = pred.apply(p["p"], z_ctx)
-        zs_t = jax.lax.stop_gradient(enc.apply(tgt, x))
-        z_full = zs_t[jnp.arange(len(x)), t_full - 1]
-        return jnp.mean((pz - z_full) ** 2)
+    def loss_fn(p, tgt, x, batch_lens, t_ctx, t_tgt):
+        zs = enc.apply(p["e"], x, batch_lens)
+        z_ctx = unit_normalize(zs[jnp.arange(len(x)), t_ctx - 1])
+        pz = unit_normalize(pred.apply(p["p"], z_ctx))
+        zs_t = jax.lax.stop_gradient(enc.apply(tgt, x, batch_lens))
+        z_tgt = unit_normalize(zs_t[jnp.arange(len(x)), t_tgt - 1])
+        return jnp.mean((pz - z_tgt) ** 2)
 
     @jax.jit
     def upd(params, target, opt, idx, tk):
         t_full = lens[idx]
         t_ctx = jax.random.randint(tk, t_full.shape, tmin, t_full)
-        g = jax.grad(loss_fn)(params, target, Xj[idx], t_ctx, t_full)
+        if use_full:
+            t_tgt = t_full
+        else:
+            # Sample a strictly later valid prefix when room exists.
+            t_tgt = jax.random.randint(tk, t_full.shape, t_ctx + 1, t_full + 1)
+        g = jax.grad(loss_fn)(params, target, Xj[idx], lens[idx], t_ctx, t_tgt)
         u, opt = tx.update(g, opt)
         params = optax.apply_updates(params, u)
-        target = jax.tree_util.tree_map(lambda a, b: EMA * a + (1 - EMA) * b,
-                                        target, params["e"])
+        target = jax.tree_util.tree_map(
+            lambda a, b: EMA * a + (1 - EMA) * b, target, params["e"]
+        )
         return params, target, opt
 
     for s in range(steps):
         rng, bk, tk = jax.random.split(rng, 3)
         idx = jax.random.choice(bk, n, (min(BATCH, n),), replace=False)
         params, target, opt = upd(params, target, opt, idx, tk)
-    return np.asarray(enc.apply(params["e"], Xj))
+
+    z = encode_jepa_gru(params["e"], X, lengths_np, lat=lat, hid=hid)
+    return z, params["e"], target
+
+
+def train_jepa_gru(
+    X,
+    lengths,
+    rng,
+    lat=2,
+    hid=HID,
+    steps=STEPS,
+    tmin=3,
+    target_mode: str = "later_prefix",
+):
+    """Compatibility wrapper: return only per-prefix latents ``(N, T, lat)``."""
+    z, _, _ = train_jepa_gru_with_params(
+        X,
+        lengths,
+        rng,
+        lat=lat,
+        hid=hid,
+        steps=steps,
+        tmin=tmin,
+        target_mode=target_mode,
+    )
+    return z
+
+
+def encode_jepa_gru(params, X, lengths=None, lat=2, hid=HID) -> np.ndarray:
+    """Frozen online encode with optional pad lengths. Returns ``(N, T, lat)``."""
+    enc = GRUEnc(lat=lat, hid=hid)
+    Xj = jnp.asarray(X)
+    if lengths is None:
+        z = enc.apply(params, Xj)
+    else:
+        z = enc.apply(params, Xj, jnp.asarray(lengths, dtype=jnp.int32))
+    return np.asarray(unit_normalize(z))
 
 
 def supervised_contrastive_loss(z, labels, temperature=0.20):
     """Identity-grounded contrastive loss for an episode-level latent.
 
-    The labels identify positive pairs only. They are never passed to the
-    encoder as inputs and no classifier head is optimized. Every batch needs
-    at least two examples of each identity, which the objective-typed dataset
-    satisfies by sampling across many rollout episodes.
+    Labels identify positive pairs only. This path is a supervised ceiling and
+    must not be reported on the SSL axis.
     """
-
     z = unit_normalize(z)
     logits = z @ z.T / temperature
     n = logits.shape[0]
@@ -271,12 +374,6 @@ def supervised_contrastive_loss(z, labels, temperature=0.20):
     return jnp.mean(per_row)
 
 
-def unit_normalize(z):
-    """Map trajectory embeddings to the unit sphere for stable JEPA training."""
-
-    return z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-6)
-
-
 def train_identity_jepa_with_params(
     Xc,
     Xt,
@@ -285,21 +382,24 @@ def train_identity_jepa_with_params(
     lat=2,
     steps=STEPS,
     contrastive_weight=1.0,
+    *,
+    uses_eval_labels: bool = False,
 ):
     """Train a stable JEPA encoder with an identity-grounded contrastive term.
 
-    JEPA still predicts the target-window representation. The additional
-    contrastive objective makes behavior type an explicit representative target
-    through positive/negative episode pairs. Returns the context latent and
-    the encoder parameters needed for rollout-time inference.
+    Requires ``uses_eval_labels=True`` to acknowledge this is a supervised
+    ceiling, not the primary SSL encoder.
     """
+    if not uses_eval_labels:
+        raise ValueError(
+            "train_identity_jepa_with_params uses evaluation labels; "
+            "pass uses_eval_labels=True to acknowledge the supervised ceiling"
+        )
 
     enc, pred = Enc(lat=lat), Pred(lat=lat)
     rng, ke, kp = jax.random.split(rng, 3)
     params = {"e": enc.init(ke, Xc[:1]), "p": pred.init(kp, jnp.zeros((1, lat)))}
     target = params["e"]
-    # A clipped, mildly regularized optimizer keeps the representative space
-    # stable when a held-out checkpoint activates an otherwise rare feature.
     tx = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(1e-3, weight_decay=1e-5),
@@ -313,8 +413,6 @@ def train_identity_jepa_with_params(
         z = unit_normalize(enc.apply(p["e"], xc))
         pz = unit_normalize(pred.apply(p["p"], z))
         target_z = jax.lax.stop_gradient(unit_normalize(enc.apply(tgt, xt)))
-        # Unit-normalized cosine prediction prevents norm growth from carrying
-        # the predictive objective.  Strategy identity is represented by angle.
         jepa = jnp.mean(1.0 - jnp.sum(pz * target_z, axis=-1))
         contrastive = supervised_contrastive_loss(z, label)
         return jepa + contrastive_weight * contrastive
@@ -336,44 +434,97 @@ def train_identity_jepa_with_params(
     return np.asarray(unit_normalize(enc.apply(params["e"], Xcj))), params["e"]
 
 
-def train_identity_jepa(Xc, Xt, identity, rng, lat=2, steps=STEPS, contrastive_weight=1.0):
+def train_identity_jepa(
+    Xc,
+    Xt,
+    identity,
+    rng,
+    lat=2,
+    steps=STEPS,
+    contrastive_weight=1.0,
+    *,
+    uses_eval_labels: bool = False,
+):
     """Return the ID-JEPA latent when rollout-time encoder parameters are not needed."""
-
     z, _ = train_identity_jepa_with_params(
-        Xc, Xt, identity, rng, lat=lat, steps=steps,
+        Xc,
+        Xt,
+        identity,
+        rng,
+        lat=lat,
+        steps=steps,
         contrastive_weight=contrastive_weight,
+        uses_eval_labels=uses_eval_labels,
     )
     return z
 
 
-def encode_identity_jepa(params, X):
+def encode_identity_jepa(params, X, lat: int | None = None):
     """Run the trained ID-JEPA encoder on standardized context features."""
-
-    z = Enc(lat=params["params"]["Dense_2"]["kernel"].shape[-1]).apply(params, jnp.asarray(X))
+    if lat is None:
+        lat = int(params["params"]["Dense_2"]["kernel"].shape[-1])
+    z = Enc(lat=lat).apply(params, jnp.asarray(X))
     return np.asarray(unit_normalize(z))
 
 
-def evaluate_encoders(Xc, Xt, y, n_classes, seeds=(0, 1, 2), lat=2,
-                      steps=STEPS, keep_z_seed=0):
-    """Train VAE and JEPA over several encoder seeds; return mean/std metrics
-    and one representative latent per encoder (from keep_z_seed) for scatter
-    plots. Xc = standardized context windows, Xt = standardized target windows."""
-    out = {"vae": {"probe": [], "ari": []}, "jepa": {"probe": [], "ari": []}}
-    z_keep = {}
+def evaluate_encoders(
+    Xc,
+    Xt,
+    y,
+    n_classes,
+    seeds=(0, 1, 2),
+    lat=2,
+    steps=STEPS,
+    keep_z_seed=0,
+    X_seq=None,
+    lengths=None,
+    hid=HID,
+):
+    """Train VAE / window JEPA / optional GRU-JEPA over encoder seeds.
+
+    When ``X_seq`` and ``lengths`` are provided, also evaluates GRU-JEPA using
+    full-episode (length-indexed) embeddings.
+    """
+    out: dict[str, dict[str, list]] = {
+        "vae": {"probe": [], "ari": []},
+        "jepa": {"probe": [], "ari": []},
+    }
+    if X_seq is not None:
+        if lengths is None:
+            raise ValueError("lengths required when X_seq is provided")
+        out["jepa_gru"] = {"probe": [], "ari": [], "collapse": []}
+    z_keep: dict[str, Any] = {}
     for s in seeds:
         zv = train_vae(Xc, jax.random.PRNGKey(s), lat=lat, steps=steps)
         zj = train_jepa(Xc, Xt, jax.random.PRNGKey(s), lat=lat, steps=steps)
-        for name, z in (("vae", zv), ("jepa", zj)):
+        variants = [("vae", zv), ("jepa", zj)]
+        if X_seq is not None:
+            zg, _, _ = train_jepa_gru_with_params(
+                X_seq,
+                lengths,
+                jax.random.PRNGKey(s),
+                lat=lat,
+                hid=hid,
+                steps=steps,
+            )
+            z_full = gather_prefix_latents(zg, lengths)
+            variants.append(("jepa_gru", z_full))
+            out["jepa_gru"]["collapse"].append(collapse_diagnostics(z_full))
+        for name, z in variants:
             p, a = metrics(z, y, n_classes)
             out[name]["probe"].append(p)
             out[name]["ari"].append(a)
             if s == keep_z_seed:
                 z_keep[name] = z
-    summary = {}
+    summary: dict[str, Any] = {}
     for name in out:
         for m in ("probe", "ari"):
+            if m not in out[name]:
+                continue
             v = np.asarray(out[name][m])
             summary[f"{name}_{m}_mean"] = float(v.mean())
             summary[f"{name}_{m}_std"] = float(v.std())
             summary[f"{name}_{m}_all"] = v
+        if "collapse" in out[name] and out[name]["collapse"]:
+            summary[f"{name}_collapse"] = out[name]["collapse"]
     return summary, z_keep

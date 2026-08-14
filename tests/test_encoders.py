@@ -9,7 +9,20 @@ pytest.importorskip("optax")
 import jax
 import jax.numpy as jnp
 
-from mopa.encoders import Enc, GRUEnc, Pred, train_jepa, train_jepa_gru
+from mopa.encoders import (
+    Enc,
+    GRUEnc,
+    Pred,
+    collapse_diagnostics,
+    effective_rank,
+    encode_jepa_gru,
+    gather_prefix_latents,
+    train_identity_jepa,
+    train_jepa,
+    train_jepa_gru,
+    train_jepa_gru_with_params,
+    unit_normalize,
+)
 
 
 def _param_names(tree):
@@ -55,6 +68,24 @@ def test_gru_prefix_latent_ignores_future_steps():
     assert not np.allclose(z[:, 9], z_mut[:, 9])
 
 
+def test_gru_pad_mask_ignores_suffix_garbage():
+    enc = GRUEnc(lat=2, hid=16)
+    rng = jax.random.PRNGKey(1)
+    x = jax.random.normal(rng, (4, 8, 3))
+    lengths = np.array([3, 5, 4, 6], dtype=np.int32)
+    params = enc.init(rng, x, lengths)
+    z = enc.apply(params, x, lengths)
+
+    x_bad = x.at[:, :, :].set(x)
+    x_bad = x_bad.at[0, 3:].set(123.0)
+    x_bad = x_bad.at[1, 5:].set(-77.0)
+    z_bad = enc.apply(params, x_bad, lengths)
+
+    for i, L in enumerate(lengths):
+        np.testing.assert_allclose(z[i, :L], z_bad[i, :L], atol=1e-5)
+        np.testing.assert_allclose(z[i, L - 1], z_bad[i, L - 1], atol=1e-5)
+
+
 def test_train_jepa_gru_handles_variable_lengths():
     rng = np.random.default_rng(0)
     x = rng.normal(size=(32, 12, 4)).astype(np.float32)
@@ -64,6 +95,23 @@ def test_train_jepa_gru_handles_variable_lengths():
     )
     assert z.shape == (32, 12, 2)
     assert np.isfinite(z).all()
+    # Unit-sphere outputs.
+    norms = np.linalg.norm(z[:, 0], axis=-1)
+    np.testing.assert_allclose(norms, np.ones_like(norms), atol=1e-4)
+
+
+def test_train_jepa_gru_with_params_roundtrip():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(16, 10, 3)).astype(np.float32)
+    lengths = np.full(16, 8, dtype=np.int32)
+    z, params, target = train_jepa_gru_with_params(
+        x, lengths, jax.random.PRNGKey(0), lat=2, hid=16, steps=5
+    )
+    z2 = encode_jepa_gru(params, x, lengths, lat=2, hid=16)
+    np.testing.assert_allclose(z, z2, atol=1e-5)
+    assert target is not None
+    full = gather_prefix_latents(z, lengths)
+    assert full.shape == (16, 2)
 
 
 def test_train_jepa_smoke():
@@ -73,3 +121,31 @@ def test_train_jepa_smoke():
     z = train_jepa(xc, xt, jax.random.PRNGKey(0), lat=2, steps=5)
     assert z.shape == (32, 2)
     assert np.isfinite(z).all()
+
+
+def test_collapse_diagnostics_distinguish_constant_vs_diverse():
+    const = np.ones((20, 2), dtype=np.float32)
+    d_const = collapse_diagnostics(const)
+    assert d_const["across_std_mean"] < 1e-6
+    assert d_const["effective_rank"] < 1.1
+
+    rng = np.random.default_rng(0)
+    diverse = rng.normal(size=(20, 2)).astype(np.float32)
+    d_div = collapse_diagnostics(diverse)
+    assert d_div["across_std_mean"] > 0.5
+    assert effective_rank(diverse) > effective_rank(const)
+
+
+def test_identity_jepa_requires_explicit_label_flag():
+    rng = np.random.default_rng(0)
+    xc = rng.normal(size=(8, 4)).astype(np.float32)
+    xt = rng.normal(size=(8, 4)).astype(np.float32)
+    y = np.array([0, 0, 1, 1, 2, 2, 0, 1], dtype=np.int32)
+    with pytest.raises(ValueError, match="uses_eval_labels"):
+        train_identity_jepa(xc, xt, y, jax.random.PRNGKey(0), steps=2)
+
+
+def test_unit_normalize_maps_to_sphere():
+    z = jnp.asarray([[3.0, 4.0], [0.0, 2.0]])
+    u = np.asarray(unit_normalize(z))
+    np.testing.assert_allclose(np.linalg.norm(u, axis=-1), [1.0, 1.0], atol=1e-5)

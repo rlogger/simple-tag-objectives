@@ -1,11 +1,14 @@
-# simple-tag-objectives
+# opponent-modeling
 
-Minimal JaxMARL **environment** + **Part 1 opponent modeling** scaffold
-(GRU-JEPA / VAE, soft beliefs, latent-conditioned BC) and a slimmed **MAPPO**
-trainer for objective-typed specialists.
+Objective-typed predator–prey environment and Part 1 opponent-modeling
+scaffold (GRU-JEPA / VAE, soft beliefs, latent-conditioned BC), plus a slimmed
+MAPPO trainer for specialists.
 
-- Env contract: [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md)
-- Part 1 vision + metrics: [`docs/PART1.md`](docs/PART1.md)
+Packages: `tag_objectives` (env), `mopa` (Part 1 + data/metrics/BC).
+
+- Env: [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md)
+- Part 1: [`docs/PART1.md`](docs/PART1.md)
+- Slides: [`docs/presentation-part1.html`](docs/presentation-part1.html)
 
 ## Install
 
@@ -45,13 +48,14 @@ Checkpoints land under `logs/MPE_simple_tag_v3/`.
 src/tag_objectives/   # env
 src/mopa/             # Part 1: encoders, belief, bc, data, metrics
 scripts/train_mappo.py
+scripts/run_part1.py
 configs/alg/mappo_objectives_{capture,risk,curious}.yaml
-docs/{ENVIRONMENT,PART1}.md
+docs/{ENVIRONMENT,PART1,PART1_GUIDELINES}.md
 tests/
 ```
 
 ## Test
 
 ```bash
-pytest -q
+PYTHONPATH=src pytest -q
 ```

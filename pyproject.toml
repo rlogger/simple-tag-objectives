@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "simple-tag-objectives"
+name = "opponent-modeling"
 version = "0.1.0"
-description = "Objective-typed predator-prey env + Part 1 opponent modeling (GRU-JEPA, belief, BC) and MAPPO specialists."
+description = "Objective-typed tag env and Part 1 opponent modeling (GRU-JEPA, belief, BC) with MAPPO specialists."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

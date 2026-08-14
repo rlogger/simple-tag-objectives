@@ -21,7 +21,7 @@ from numpy.typing import NDArray
 
 from mopa.features import EP_LEN
 from mopa.samples import build_predator_samples
-from mopa.splits import episode_validation_mask
+from mopa.splits import episode_validation_mask, group_validation_mask
 from mopa.types import BCRunStats
 
 BC_HID = 128
@@ -65,11 +65,14 @@ def build_samples(
 
     State = absolute positions of all agents + velocity proxy + predator id
     one-hot. Valid steps: ``t in [ctx, t_max)`` excluding the auto-reset
-    boundary.
+    boundary and post-capture frozen frames when ``capture_t`` is present.
     """
     if t_max is None:
         t_max = min(ep_len, int(ds["pred_act"].shape[1]))
-    return build_predator_samples(ds, ctx, t_max, ep_len=ep_len)
+    capture_t = ds["capture_t"] if "capture_t" in ds else None
+    return build_predator_samples(
+        dict(ds), ctx, t_max, ep_len=ep_len, capture_t=capture_t
+    )
 
 
 def train_eval_bc(
@@ -79,9 +82,22 @@ def train_eval_bc(
     rng_seed: int,
     val_frac: float = 0.2,
     steps: int = BC_STEPS,
+    group_ids: Arrayi | None = None,
+    split_seed: int | None = None,
 ) -> float:
-    """Episode-level split, train a BC net, return held-out action accuracy."""
-    vmask = episode_validation_mask(ep, rng_seed=rng_seed, val_frac=val_frac)
+    """Train a BC net and return held-out action accuracy.
+
+    By default splits by episode. When ``group_ids`` is provided (e.g.
+    checkpoint seeds broadcast to sample rows), holds out whole groups.
+    ``split_seed`` defaults to ``rng_seed`` for backward compatibility.
+    """
+    split_rng = rng_seed if split_seed is None else split_seed
+    if group_ids is None:
+        vmask = episode_validation_mask(ep, rng_seed=split_rng, val_frac=val_frac)
+    else:
+        if len(group_ids) != len(ep):
+            raise ValueError("group_ids must align with samples")
+        vmask = group_validation_mask(group_ids, rng_seed=split_rng, val_frac=val_frac)
     Str, Atr, Sva, Ava = S[~vmask], A[~vmask], S[vmask], A[vmask]
 
     mu, sd = Str.mean(0), Str.std(0) + 1e-6
@@ -120,13 +136,28 @@ def bc_comparison(
     z_dict: Mapping[str, np.ndarray | None],
     ctx: int,
     seeds: Sequence[int] = (0, 1, 2),
+    group_ids: Arrayi | None = None,
+    split: str = "episode",
 ) -> dict[str, BCRunStats]:
     """Run BC for each conditioning variant.
 
     ``z_dict`` maps variant name → per-episode conditioning array ``(N, d)``,
     or ``None`` for the unconditioned baseline.
+
+    ``split="checkpoint"`` uses ``ds['ckpt_seed']`` (or provided ``group_ids``)
+    broadcast onto sample rows so held-out checkpoints never appear in train.
     """
     S0, A, ep = build_samples(ds, ctx)
+    sample_groups = None
+    if split == "checkpoint":
+        if group_ids is None:
+            if "ckpt_seed" not in ds:
+                raise ValueError("checkpoint split requires ckpt_seed on the dataset")
+            group_ids = np.asarray(ds["ckpt_seed"])
+        sample_groups = np.asarray(group_ids, dtype=np.int32)[ep]
+    elif split != "episode":
+        raise ValueError(f"unknown split={split!r}")
+
     results: dict[str, BCRunStats] = {}
     for name, z in z_dict.items():
         if z is None:
@@ -135,7 +166,9 @@ def bc_comparison(
             # Append raw z; train_eval_bc standardizes from the train fold only
             # so val episodes never influence feature scale.
             S = np.concatenate([S0, np.asarray(z, dtype=np.float32)[ep]], -1)
-        runs = tuple(train_eval_bc(S, A, ep, s) for s in seeds)
+        runs = tuple(
+            train_eval_bc(S, A, ep, s, group_ids=sample_groups) for s in seeds
+        )
         v = np.asarray(runs)
         results[name] = BCRunStats(mean=float(v.mean()), std=float(v.std()), runs=runs)
         suffix = f",{name}" if z is not None else ""
