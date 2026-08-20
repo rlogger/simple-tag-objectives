@@ -98,7 +98,7 @@ def evaluate_policy(
             jax.random.split(ks, n_eps), state, acts
         )
         af = active.astype(jnp.float32)
-        pred_lava += info["pred_lava"][:, 0] * af
+        pred_lava += jnp.sum(info["pred_lava"][:, :P], axis=-1) * af
         prey_lava += info["prey_lava"][:, prey_idx] * af
         state = freeze_tree(active, new_state, state)
         obs = freeze_tree(active, new_obs, obs)

@@ -10,7 +10,6 @@ SEED: 0
 ENTITY: ""
 PROJECT: "simple-tag-objectives"
 WANDB_MODE: "disabled"
-WANDB_LOG_ALL_SEEDS: False
 
 # where to save the params
 SAVE_PATH: "logs"

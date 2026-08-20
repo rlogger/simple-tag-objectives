@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple
 
 import distrax
+import flax.linen as nn
 import hydra
 import jax
 import jax.numpy as jnp
@@ -25,15 +26,17 @@ import optax
 import wandb
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
-from omegaconf import OmegaConf
-import flax.linen as nn
-
 from jaxmarl.wrappers.baselines import MPELogWrapper
-
-from tag_objectives import SimpleTagObjectivesMPE
+from omegaconf import OmegaConf
 
 # Hydra changes CWD; keep repo-root configs reachable.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC = _REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from tag_objectives import SimpleTagObjectivesMPE  # noqa: E402
+
 _CONFIG_DIR = str(_REPO_ROOT / "configs")
 
 
@@ -270,7 +273,6 @@ def make_train(config, env):
                 config["NUM_STEPS"],
             )
 
-            padded_last = pad_obs(last_obs)
             ws_last = get_world_state(last_obs)
 
             def _update_team(t, actor_state, critic_state, traj):

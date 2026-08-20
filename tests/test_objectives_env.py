@@ -320,7 +320,7 @@ def test_mixed_team_rejects_wrong_length():
         SimpleTagObjectivesMPE(pred_type=("capture", "risk"), num_adversaries=3)
 
 
-def test_lava_v5_default_constants():
+def test_current_lava_default_constants():
     env = SimpleTagObjectivesMPE(pred_type="risk")
     assert env.lava_penalty == 100.0
     assert env.base_lava_penalty == 0.0

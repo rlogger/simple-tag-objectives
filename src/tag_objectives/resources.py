@@ -22,7 +22,6 @@ import chex
 import jax
 import jax.numpy as jnp
 from flax import struct
-
 from jaxmarl.environments.mpe.simple_tag import SimpleTagMPE
 from jaxmarl.environments.spaces import Box
 

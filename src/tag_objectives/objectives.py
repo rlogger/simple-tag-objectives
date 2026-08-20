@@ -17,7 +17,7 @@ ctx channels (computed once per step): ``capture_f`` scalar, per-predator
 ``dist`` / ``in_lava`` / ``new_cell`` / ``pred_pos``, ``prey_pos``,
 ``prey_lava``, plus ``state`` / ``new_state``.
 
-Defaults (v5): lava penalty is -100 for the risk-averse predator and 0 for
+Current defaults: lava penalty is -100 for the risk-averse predator and 0 for
 everyone else (``lava_penalty=100``, ``base_lava_penalty=0``,
 ``prey_lava_penalty=0``).
 
@@ -34,7 +34,6 @@ import chex
 import jax
 import jax.numpy as jnp
 from flax import struct
-
 from jaxmarl.environments.mpe.simple_tag import SimpleTagMPE
 from jaxmarl.environments.spaces import Box
 

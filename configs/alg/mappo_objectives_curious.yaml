@@ -22,6 +22,3 @@ ENV_NAME: "MPE_simple_tag_v3"
 ENV_KWARGS: {}
 USE_OBJECTIVES: True
 PRED_TYPE: "curious"
-
-# eval
-TEST_DURING_TRAINING: False
