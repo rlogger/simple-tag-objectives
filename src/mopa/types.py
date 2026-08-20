@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator
 
 import numpy as np
 from numpy.typing import NDArray
@@ -55,6 +55,8 @@ class ObjectiveDataset(_ArrayMapping):
     pred_coverage: Arrayf
     label: Arrayi
     ckpt_seed: Arrayi
+    env_seed: Arrayi
+    valid_length: Arrayi
 
 
 @dataclass(frozen=True)

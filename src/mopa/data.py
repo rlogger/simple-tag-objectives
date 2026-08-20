@@ -59,26 +59,33 @@ def rollout_one_checkpoint(
     *,
     logdir: Path | str = DEFAULT_LOGDIR,
     num_steps: int = EP_LEN,
+    num_adversaries: int = 1,
+    prey_type: str | None = None,
 ) -> dict[str, np.ndarray]:
     """Roll out one MAPPO checkpoint greedily for ``num_eps`` first episodes."""
     from jaxmarl.wrappers.baselines import load_params
 
     logdir = Path(logdir)
-    env = SimpleTagObjectivesMPE(pred_type=pred_type)
+    env = SimpleTagObjectivesMPE(
+        pred_type=pred_type, num_adversaries=num_adversaries
+    )
     preds = [a for a in env.agents if a.startswith("adversary")]
     prey_agents = [a for a in env.agents if a.startswith("agent")]
     teams = {"pred": preds, "prey": prey_agents}
-    pred_name = preds[0]
     prey_name = prey_agents[0]
-    pred_idx = env.agents.index(pred_name)
+    pred_indices = [env.agents.index(name) for name in preds]
     prey_idx = env.agents.index(prey_name)
-    action_dim = env.action_space(pred_name).n
+    action_dim = env.action_space(preds[0]).n
 
     obs_sizes = {a: env.observation_space(a).shape[0] for a in env.agents}
     max_obs = max(obs_sizes.values())
     nets = {t: ActorLogits(action_dim=action_dim, hidden_dim=HIDDEN) for t in teams}
+    prey_checkpoint_type = pred_type if prey_type is None else prey_type
     params = {
-        t: load_params(str(_params_path(logdir, pred_type, t, seed_idx))) for t in teams
+        "pred": load_params(str(_params_path(logdir, pred_type, "pred", seed_idx))),
+        "prey": load_params(
+            str(_params_path(logdir, prey_checkpoint_type, "prey", seed_idx))
+        ),
     }
 
     rng_key, k_reset = jax.random.split(rng_key)
@@ -86,7 +93,7 @@ def rollout_one_checkpoint(
     obs, state = jax.vmap(env.reset)(reset_keys)
 
     prey_pos = [np.asarray(state.p_pos[:, prey_idx])]
-    pred_pos = [np.asarray(state.p_pos[:, [pred_idx]])]
+    pred_pos = [np.asarray(state.p_pos[:, pred_indices])]
     prey_acts, pred_acts = [], []
 
     done = jnp.zeros((num_eps,), dtype=bool)
@@ -107,7 +114,9 @@ def rollout_one_checkpoint(
             step_keys, state, all_actions
         )
 
-        pred_lava_steps += info["pred_lava"][:, pred_idx] * active.astype(jnp.float32)
+        pred_lava_steps += jnp.sum(
+            info["pred_lava"][:, pred_indices], axis=-1
+        ) * active.astype(jnp.float32)
         prey_lava_steps += info["prey_lava"][:, prey_idx] * active.astype(jnp.float32)
 
         state = freeze_tree(active, new_state, state)
@@ -115,10 +124,16 @@ def rollout_one_checkpoint(
         done = done | dones["__all__"]
 
         prey_pos.append(np.asarray(state.p_pos[:, prey_idx]))
-        pred_pos.append(np.asarray(state.p_pos[:, [pred_idx]]))
+        pred_pos.append(np.asarray(state.p_pos[:, pred_indices]))
         prey_acts.append(np.asarray(jnp.where(active, all_actions[prey_name], 0)))
         pred_acts.append(
-            np.asarray(jnp.where(active, all_actions[pred_name], 0))[:, None]
+            np.stack(
+                [
+                    np.asarray(jnp.where(active, all_actions[name], 0))
+                    for name in preds
+                ],
+                axis=-1,
+            )
         )
 
     capture_t = np.asarray(state.capture_t)
@@ -142,6 +157,8 @@ def rollout_one_checkpoint(
         pred_coverage=np.asarray(
             jnp.sum(state.visited.astype(jnp.float32), axis=-1)
         ).astype(np.float32),
+        env_seed=np.asarray(reset_keys, dtype=np.uint32),
+        valid_length=np.where(captured, capture_t, num_steps).astype(np.int32),
     )
 
 
@@ -151,8 +168,16 @@ def objective_dataset(
     rng0: int = 0,
     num_steps: int | None = None,
     logdir: Path | str = DEFAULT_LOGDIR,
+    num_adversaries: int = 1,
+    prey_type: str | None = "capture",
 ) -> ObjectiveDataset:
-    """Roll out objective-typed MAPPO checkpoints; ``label`` is 0/1/2."""
+    """Roll out objective-typed predators against one declared prey policy.
+
+    ``prey_type=None`` reproduces matched co-training pairs and is useful only
+    as a confounded control. The default fixes the prey checkpoint family to
+    ``capture`` so objective labels cannot identify three different prey
+    policies.
+    """
     steps = int(num_steps if num_steps is not None else EP_LEN)
     rows: dict[str, list[Any]] = {
         k: []
@@ -172,6 +197,8 @@ def objective_dataset(
             "pred_coverage",
             "label",
             "ckpt_seed",
+            "env_seed",
+            "valid_length",
         )
     }
 
@@ -181,9 +208,14 @@ def objective_dataset(
                 pred_type,
                 seed,
                 n_eps,
-                jax.random.PRNGKey(rng0 + 1000 * lab + seed),
+                # Match reset/transition randomness across objective labels so
+                # the label cannot be inferred from a different environment
+                # seed distribution.
+                jax.random.PRNGKey(rng0 + seed),
                 logdir=logdir,
                 num_steps=steps,
+                num_adversaries=num_adversaries,
+                prey_type=prey_type,
             )
             n = len(d["positions"])
             rows["prey_pos"].append(d["positions"])
@@ -201,6 +233,8 @@ def objective_dataset(
             rows["pred_coverage"].append(d["pred_coverage"])
             rows["label"].append(np.full(n, lab, np.int32))
             rows["ckpt_seed"].append(np.full(n, seed, np.int32))
+            rows["env_seed"].append(d["env_seed"])
+            rows["valid_length"].append(d["valid_length"])
 
     float_keys = {
         "prey_pos",
@@ -214,7 +248,13 @@ def objective_dataset(
         "pred_coverage",
     }
     stacked = {
-        key: np.concatenate(vals).astype(np.float32 if key in float_keys else np.int32)
+        key: np.concatenate(vals).astype(
+            np.float32
+            if key in float_keys
+            else np.uint32
+            if key == "env_seed"
+            else np.int32
+        )
         for key, vals in rows.items()
     }
     return ObjectiveDataset(**stacked)

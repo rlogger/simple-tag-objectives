@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MPLCONFIGDIR: /tmp/opponent-modeling-mpl
+      UV_PROJECT_ENVIRONMENT: venv
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.3"
+          enable-cache: true
+      - run: uv sync --locked --all-extras
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+      - name: One-update MAPPO smoke
+        run: >-
+          uv run python scripts/train_mappo.py
+          alg=mappo_objectives_capture
+          NUM_SEEDS=1
+          alg.TOTAL_TIMESTEPS=8
+          alg.NUM_ENVS=2
+          alg.NUM_STEPS=4
+          alg.HIDDEN_SIZE=16
+          alg.UPDATE_EPOCHS=1
+          alg.NUM_MINIBATCHES=1
+          SAVE_PATH=null
+          hydra.run.dir=/tmp/opponent-modeling-hydra
+          hydra.output_subdir=null

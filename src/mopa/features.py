@@ -84,6 +84,87 @@ def window(pos: np.ndarray, k: int, kmax: int | None = None) -> np.ndarray:
     return flat.reshape(len(ep), -1).astype(np.float32)
 
 
+def sequence_window(
+    sequence: np.ndarray,
+    start: int,
+    stop: int,
+    *,
+    lengths: np.ndarray | None = None,
+) -> np.ndarray:
+    """Flatten one masked interval from a shared trajectory feature tensor.
+
+    All encoder baselines and the supervised oracle can use this function so
+    they see the same ``(prey, predator, velocity)`` schema.  Values outside
+    ``[start, stop)`` and beyond an episode's valid length are zero.
+    """
+    x = np.asarray(sequence, dtype=np.float32)
+    if x.ndim != 3:
+        raise ValueError("sequence must have shape (N, T, F)")
+    if not 0 <= start < stop <= x.shape[1]:
+        raise ValueError(f"invalid sequence interval [{start}, {stop})")
+    mask = np.zeros(x.shape[:2], dtype=bool)
+    mask[:, start:stop] = True
+    if lengths is not None:
+        lens = np.clip(np.asarray(lengths, dtype=np.int32), 1, x.shape[1])
+        if lens.shape != (len(x),):
+            raise ValueError("lengths must have shape (N,)")
+        mask &= np.arange(x.shape[1])[None, :] < lens[:, None]
+    return (x * mask[..., None]).reshape(len(x), -1).astype(np.float32)
+
+
+def sequence_slice(
+    sequence: np.ndarray,
+    start: int,
+    width: int,
+    *,
+    lengths: np.ndarray | None = None,
+) -> np.ndarray:
+    """Pack a fixed-width trajectory interval into relative-time features."""
+    x = np.asarray(sequence, dtype=np.float32)
+    if x.ndim != 3:
+        raise ValueError("sequence must have shape (N, T, F)")
+    if start < 0 or width < 1 or start + width > x.shape[1]:
+        raise ValueError("slice must fit inside the sequence horizon")
+    out = np.array(x[:, start : start + width], copy=True)
+    if lengths is not None:
+        lens = np.asarray(lengths, dtype=np.int32)
+        if lens.shape != (len(x),):
+            raise ValueError("lengths must have shape (N,)")
+        valid = start + np.arange(width)[None, :] < lens[:, None]
+        out *= valid[..., None].astype(np.float32)
+    return out.reshape(len(x), -1).astype(np.float32)
+
+
+def trailing_sequence_slice(
+    sequence: np.ndarray,
+    ends: np.ndarray,
+    width: int,
+) -> np.ndarray:
+    """Pack each episode's latest valid window ending at ``ends[i]``.
+
+    Short prefixes are left-aligned and zero-padded. Longer prefixes retain the
+    latest ``width`` steps, which makes a fixed-window baseline genuinely
+    online instead of remaining frozen on the first window forever.
+    """
+    x = np.asarray(sequence, dtype=np.float32)
+    end_array = np.asarray(ends, dtype=np.int32)
+    if x.ndim != 3:
+        raise ValueError("sequence must have shape (N, T, F)")
+    if width < 1 or width > x.shape[1]:
+        raise ValueError("width must fit inside the sequence horizon")
+    if end_array.shape != (len(x),):
+        raise ValueError("ends must have shape (N,)")
+    if np.any(end_array < 1) or np.any(end_array > x.shape[1]):
+        raise ValueError("ends must be within the sequence horizon")
+
+    output = np.zeros((len(x), width, x.shape[-1]), dtype=np.float32)
+    for index, end in enumerate(end_array):
+        start = max(0, int(end) - width)
+        values = x[index, start : int(end)]
+        output[index, : len(values)] = values
+    return output.reshape(len(x), -1)
+
+
 def standardize(
     X: np.ndarray,
     mu: np.ndarray | None = None,

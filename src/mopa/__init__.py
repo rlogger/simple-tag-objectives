@@ -1,62 +1,127 @@
-"""mopa — Modeling OPponent Agents (Part 1 scaffold).
+"""mopa - Modeling OPponent Agents.
 
-Uncertainty-aware opponent modeling on the objective-typed predator env:
-GRU-JEPA / VAE encoders, soft strategy beliefs, latent-conditioned BC.
+GRU-JEPA representation learning, sequential strategy beliefs, mixture
+policies, replay provenance, and contrastive preference learning.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from mopa.belief import Belief, categorical_entropy, fit_latent_belief
+from mopa.cpl import (
+    BluePlannerRequest,
+    OpponentPolicyRequest,
+    PlannedStep,
+    PreferencePair,
+    bradley_terry_cpl_loss,
+    cpl_loss,
+    generate_counterfactual,
+    trajectory_log_probability,
+)
 from mopa.encoders import (
     Enc,
     EncVAE,
     GRUEnc,
     Pred,
     collapse_diagnostics,
+    encode_jepa,
     encode_jepa_gru,
-    evaluate_encoders,
+    encode_vae,
+    squared_l2_prediction_loss,
     train_jepa,
     train_jepa_gru,
     train_jepa_gru_with_params,
+    train_jepa_with_params,
     train_vae,
+    train_vae_with_params,
 )
 from mopa.metrics import (
+    calibration_metrics,
+    classwise_ece,
     expected_calibration_error,
     metrics,
+    multiclass_brier,
+    multiclass_nll,
+    open_set_auroc,
     oracle_acc,
     probe_acc,
+    reliability_bins,
+    softmax_with_temperature,
     survival_time_probe_acc,
+    temperature_scale_logits,
     train_only_metrics,
+    train_only_oracle_acc,
+    train_only_survival_time_probe_acc,
 )
+from mopa.replay import PlannerProvenance, ReplayBuffer, Trajectory, TrajectorySchema
 from mopa.splits import checkpoint_validation_mask, episode_validation_mask
+from mopa.strategy import (
+    BayesianStrategyFilter,
+    BeliefTrace,
+    SequentialOpponentModel,
+    StrategyPolicy,
+    mixture_policy_metrics,
+    mixture_policy_probs,
+)
 from mopa.types import BCRunStats, CheckpointRef, ObjectiveDataset
 
 __all__ = [
     "BCRunStats",
+    "BayesianStrategyFilter",
     "Belief",
+    "BeliefTrace",
+    "BluePlannerRequest",
     "CheckpointRef",
     "Enc",
     "EncVAE",
     "GRUEnc",
     "ObjectiveDataset",
+    "OpponentPolicyRequest",
+    "PlannerProvenance",
+    "PlannedStep",
     "Pred",
+    "PreferencePair",
+    "ReplayBuffer",
+    "SequentialOpponentModel",
+    "StrategyPolicy",
+    "Trajectory",
+    "TrajectorySchema",
     "__version__",
+    "bradley_terry_cpl_loss",
+    "calibration_metrics",
     "categorical_entropy",
+    "classwise_ece",
     "checkpoint_validation_mask",
     "collapse_diagnostics",
+    "cpl_loss",
+    "encode_jepa",
     "encode_jepa_gru",
+    "encode_vae",
     "episode_validation_mask",
-    "evaluate_encoders",
     "expected_calibration_error",
     "fit_latent_belief",
+    "generate_counterfactual",
     "metrics",
+    "mixture_policy_metrics",
+    "mixture_policy_probs",
+    "multiclass_brier",
+    "multiclass_nll",
+    "open_set_auroc",
     "oracle_acc",
     "probe_acc",
+    "reliability_bins",
+    "softmax_with_temperature",
+    "squared_l2_prediction_loss",
     "survival_time_probe_acc",
+    "temperature_scale_logits",
+    "trajectory_log_probability",
     "train_jepa",
     "train_jepa_gru",
     "train_jepa_gru_with_params",
+    "train_jepa_with_params",
     "train_only_metrics",
+    "train_only_oracle_acc",
+    "train_only_survival_time_probe_acc",
     "train_vae",
+    "train_vae_with_params",
 ]

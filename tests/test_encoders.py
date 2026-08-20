@@ -15,12 +15,17 @@ from mopa.encoders import (
     Pred,
     collapse_diagnostics,
     effective_rank,
+    encode_jepa,
     encode_jepa_gru,
+    encode_vae,
     gather_prefix_latents,
+    squared_l2_prediction_loss,
     train_identity_jepa,
     train_jepa,
     train_jepa_gru,
     train_jepa_gru_with_params,
+    train_jepa_with_params,
+    train_vae_with_params,
     unit_normalize,
 )
 
@@ -100,6 +105,36 @@ def test_train_jepa_gru_handles_variable_lengths():
     np.testing.assert_allclose(norms, np.ones_like(norms), atol=1e-4)
 
 
+def test_gru_jepa_never_promotes_short_episode_padding_to_valid_data():
+    rng = np.random.default_rng(2)
+    x = rng.normal(size=(8, 6, 3)).astype(np.float32)
+    lengths = np.array([1, 2, 2, 3, 4, 5, 6, 1], dtype=np.int32)
+    x[lengths[:, None] <= np.arange(6)[None, :]] = 99.0
+
+    z, _, _ = train_jepa_gru_with_params(
+        x,
+        lengths,
+        jax.random.PRNGKey(0),
+        lat=2,
+        hid=8,
+        steps=3,
+        tmin=3,
+    )
+
+    assert z.shape == (8, 6, 2)
+    assert np.isfinite(z).all()
+
+    with pytest.raises(ValueError, match="length >= 2"):
+        train_jepa_gru_with_params(
+            x[:2],
+            np.ones(2, dtype=np.int32),
+            jax.random.PRNGKey(1),
+            lat=2,
+            hid=8,
+            steps=1,
+        )
+
+
 def test_train_jepa_gru_with_params_roundtrip():
     rng = np.random.default_rng(0)
     x = rng.normal(size=(16, 10, 3)).astype(np.float32)
@@ -121,6 +156,27 @@ def test_train_jepa_smoke():
     z = train_jepa(xc, xt, jax.random.PRNGKey(0), lat=2, steps=5)
     assert z.shape == (32, 2)
     assert np.isfinite(z).all()
+
+
+def test_window_jepa_and_vae_frozen_encode_roundtrip():
+    rng = np.random.default_rng(4)
+    xc = rng.normal(size=(16, 6)).astype(np.float32)
+    xt = rng.normal(size=(16, 6)).astype(np.float32)
+    zj, jepa_params = train_jepa_with_params(
+        xc, xt, jax.random.PRNGKey(0), lat=2, steps=3
+    )
+    zv, vae_params = train_vae_with_params(
+        xc, jax.random.PRNGKey(1), lat=2, steps=3
+    )
+    np.testing.assert_allclose(zj, encode_jepa(jepa_params, xc, lat=2), atol=1e-5)
+    np.testing.assert_allclose(zv, encode_vae(vae_params, xc, lat=2), atol=1e-5)
+
+
+def test_squared_l2_prediction_loss_matches_hand_calculation():
+    predicted = jnp.asarray([[1.0, 2.0], [0.0, 1.0]])
+    target = jnp.asarray([[4.0, 6.0], [0.0, -1.0]])
+    # Per-row squared L2 values are 25 and 4; batch mean is 14.5.
+    assert float(squared_l2_prediction_loss(predicted, target)) == pytest.approx(14.5)
 
 
 def test_collapse_diagnostics_distinguish_constant_vs_diverse():

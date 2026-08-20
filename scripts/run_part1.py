@@ -1,317 +1,1096 @@
 #!/usr/bin/env python3
-"""Runnable Part 1 foundation experiment with JSON artifact output.
+"""Run Part 1 and write a versioned JSON manifest.
 
-Smoke-scale defaults. Full matrix seeds/steps should be set explicitly.
-Requires MAPPO specialist checkpoints under ``--logdir`` unless ``--dry-run-checks``.
+The default is a smoke run. ``--synthetic`` creates a deterministic
+three-strategy dataset and never reads MAPPO/JaxMARL checkpoints.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
-# Allow running without editable install.
 _ROOT = Path(__file__).resolve().parents[1]
 _SRC = _ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 
-def _parse_ints(s: str) -> tuple[int, ...]:
-    return tuple(int(x.strip()) for x in s.split(",") if x.strip())
+def _parse_ints(value: str) -> tuple[int, ...]:
+    return tuple(int(item.strip()) for item in value.split(",") if item.strip())
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--logdir", type=Path, default=Path("logs") / "MPE_simple_tag_v3")
-    p.add_argument("--n-eps", type=int, default=16)
-    p.add_argument("--ckpt-seeds", type=str, default="0,1,2")
-    p.add_argument("--encoder-seeds", type=str, default="0,1,2")
-    p.add_argument("--bc-seeds", type=str, default="0,1,2")
-    p.add_argument("--lat", type=int, default=2)
-    p.add_argument("--ctx", type=int, default=10)
-    p.add_argument("--val-frac", type=float, default=0.34)
-    p.add_argument("--split", choices=("checkpoint", "episode"), default="checkpoint")
-    p.add_argument("--encoder-steps", type=int, default=200)
-    p.add_argument("--bc-steps", type=int, default=200)
-    p.add_argument("--hid", type=int, default=32)
-    p.add_argument("--out", type=Path, default=Path("artifacts/part1_run.json"))
-    p.add_argument("--dataset-cache", type=Path, default=None)
-    p.add_argument("--skip-bc", action="store_true")
-    p.add_argument(
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--logdir", type=Path, default=Path("logs") / "MPE_simple_tag_v3"
+    )
+    parser.add_argument("--n-eps", type=int, default=16)
+    parser.add_argument("--rollout-seed", type=int, default=0)
+    parser.add_argument(
+        "--prey-objective",
+        choices=("capture", "risk", "curious", "matched"),
+        default="capture",
+        help="Use one fixed prey checkpoint family; 'matched' is a confounded control.",
+    )
+    parser.add_argument("--ckpt-seeds", type=str, default="0,1,2")
+    parser.add_argument("--encoder-seeds", type=str, default="0,1,2")
+    parser.add_argument("--bc-seeds", type=str, default="0,1,2")
+    parser.add_argument("--lat", type=int, default=2)
+    parser.add_argument("--ctx", type=int, default=10)
+    parser.add_argument("--prefixes", type=str, default="5,10,25,50,100")
+    parser.add_argument("--val-frac", type=float, default=0.34)
+    parser.add_argument(
+        "--split", choices=("checkpoint", "episode"), default="checkpoint"
+    )
+    parser.add_argument("--encoder-steps", type=int, default=200)
+    parser.add_argument("--bc-steps", type=int, default=200)
+    parser.add_argument("--hid", type=int, default=32)
+    parser.add_argument("--calibration-bins", type=int, default=10)
+    parser.add_argument(
+        "--run-kind", choices=("smoke", "full"), default="smoke"
+    )
+    parser.add_argument("--out", type=Path, default=Path("artifacts/part1_run.json"))
+    parser.add_argument("--dataset-cache", type=Path, default=None)
+    parser.add_argument("--skip-bc", action="store_true")
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="Run a deterministic infrastructure smoke without checkpoints.",
+    )
+    parser.add_argument(
         "--dry-run-checks",
         action="store_true",
-        help="Validate checkpoint files and write a stub manifest, then exit.",
+        help="Validate checkpoint files, write a dry manifest, and exit.",
     )
-    return p
+    return parser
 
 
-def _params_path(logdir: Path, pred_type: str, team: str, seed_idx: int) -> Path:
-    """Mirror ``mopa.data._params_path`` without importing JaxMARL."""
-    alg = f"mappo_objectives_{pred_type}"
-    return (
-        logdir
-        / f"{alg}_MPE_simple_tag_v3_{team}_actor_seed0_vmap{seed_idx}.safetensors"
-    )
+def _params_path(logdir: Path, objective: str, team: str, seed: int) -> Path:
+    alg = f"mappo_objectives_{objective}"
+    return logdir / f"{alg}_MPE_simple_tag_v3_{team}_actor_seed0_vmap{seed}.safetensors"
 
 
-def _checkpoint_refs(logdir: Path, ckpt_seeds: tuple[int, ...]) -> list[dict]:
+def _checkpoint_refs(
+    logdir: Path,
+    seeds: tuple[int, ...],
+    prey_objective: str,
+) -> list[dict[str, Any]]:
     from mopa.manifest import file_sha256
 
-    objective_types = ("capture", "risk", "curious")
-    refs = []
-    for pred_type in objective_types:
-        for team in ("pred", "prey"):
-            for seed in ckpt_seeds:
-                path = _params_path(logdir, pred_type, team, seed)
-                entry = {
-                    "alg": f"mappo_objectives_{pred_type}",
-                    "team": team,
-                    "seed": seed,
-                    "path": str(path),
-                    "exists": path.is_file(),
-                }
-                if path.is_file():
-                    entry["sha256"] = file_sha256(path)
-                refs.append(entry)
+    refs: list[dict[str, Any]] = []
+    requested = [
+        (objective, "pred", seed)
+        for objective in ("capture", "risk", "curious")
+        for seed in seeds
+    ]
+    prey_objectives = (
+        ("capture", "risk", "curious")
+        if prey_objective == "matched"
+        else (prey_objective,)
+    )
+    requested.extend(
+        (objective, "prey", seed)
+        for objective in prey_objectives
+        for seed in seeds
+    )
+    for objective, team, seed in requested:
+        path = _params_path(logdir, objective, team, seed)
+        ref: dict[str, Any] = {
+            "alg": f"mappo_objectives_{objective}",
+            "team": team,
+            "seed": seed,
+            "path": str(path),
+            "exists": path.is_file(),
+        }
+        if path.is_file():
+            ref["sha256"] = file_sha256(path)
+        refs.append(ref)
     return refs
+
+
+def _synthetic_objective_dataset(
+    n_eps: int,
+    checkpoint_seeds: tuple[int, ...],
+    num_steps: int,
+):
+    """Build small deterministic trajectories with three visible strategies."""
+    from mopa.types import ObjectiveDataset
+
+    rows: dict[str, list[np.ndarray]] = {
+        name: [] for name in ObjectiveDataset.__dataclass_fields__
+    }
+    directions = np.asarray([[1.0, 0.2], [-0.2, 1.0], [-0.8, -0.6]])
+    offsets = np.asarray([[0.45, -0.20], [-0.20, 0.45], [-0.40, -0.35]])
+    time = np.arange(num_steps + 1, dtype=np.float32)
+
+    for label in range(3):
+        for checkpoint_seed in checkpoint_seeds:
+            for episode in range(n_eps):
+                phase = 0.17 * episode + 0.11 * checkpoint_seed
+                base = np.asarray(
+                    [-0.75 + 0.70 * label, -0.45 + 0.35 * label],
+                    dtype=np.float32,
+                )
+                wave = 0.035 * np.stack(
+                    [np.sin(0.35 * time + phase), np.cos(0.27 * time + phase)],
+                    axis=-1,
+                )
+                shift = np.asarray(
+                    [0.006 * episode, -0.004 * episode + 0.01 * checkpoint_seed],
+                    dtype=np.float32,
+                )
+                prey = (
+                    base + 0.025 * time[:, None] * directions[label] + wave + shift
+                ).astype(np.float32)
+                pred = (
+                    prey
+                    + offsets[label]
+                    + 0.02
+                    * np.stack(
+                        [np.cos(0.19 * time + phase), np.sin(0.23 * time + phase)],
+                        axis=-1,
+                    )
+                ).astype(np.float32)[:, None, :]
+
+                rows["prey_pos"].append(prey[None])
+                rows["pred_pos"].append(pred[None])
+                rows["lava_pos"].append(
+                    np.asarray([[[1.5, -1.5]]], dtype=np.float32)
+                )
+                rows["lava_rad"].append(np.asarray([[0.2]], dtype=np.float32))
+                rows["prey_act"].append(
+                    np.full((1, num_steps), (label + 1) % 3, dtype=np.int32)
+                )
+                rows["pred_act"].append(
+                    np.full((1, num_steps, 1), label, dtype=np.int32)
+                )
+                rows["capture_t"].append(np.asarray([-1], dtype=np.int32))
+                rows["captured"].append(np.asarray([0], dtype=np.int32))
+                rows["survival_time"].append(
+                    np.asarray([num_steps], dtype=np.float32)
+                )
+                rows["pred_lava_steps"].append(np.asarray([label], dtype=np.float32))
+                rows["prey_lava_steps"].append(np.asarray([0.0], dtype=np.float32))
+                rows["resources_collected"].append(
+                    np.asarray([label == 2], dtype=np.float32)
+                )
+                rows["pred_coverage"].append(
+                    np.asarray([0.2 + 0.2 * label], dtype=np.float32)
+                )
+                rows["label"].append(np.asarray([label], dtype=np.int32))
+                rows["ckpt_seed"].append(
+                    np.asarray([checkpoint_seed], dtype=np.int32)
+                )
+                rows["env_seed"].append(
+                    np.asarray(
+                        [[checkpoint_seed, episode]],
+                        dtype=np.uint32,
+                    )
+                )
+                rows["valid_length"].append(
+                    np.asarray([num_steps], dtype=np.int32)
+                )
+
+    return ObjectiveDataset(
+        **{name: np.concatenate(values, axis=0) for name, values in rows.items()}
+    )
+
+
+def _load_or_create_dataset(
+    args: argparse.Namespace,
+    checkpoint_seeds: tuple[int, ...],
+    prefixes: tuple[int, ...],
+):
+    from mopa.types import ObjectiveDataset
+
+    if args.dataset_cache is not None and args.dataset_cache.is_file():
+        with np.load(args.dataset_cache, allow_pickle=False) as raw:
+            values = {
+                name: raw[name] for name in ObjectiveDataset.__dataclass_fields__
+            }
+        return ObjectiveDataset(**values), "cache"
+
+    if args.synthetic:
+        horizon = max(8, 2 * args.ctx, max(prefixes))
+        dataset = _synthetic_objective_dataset(
+            args.n_eps, checkpoint_seeds, horizon
+        )
+        source = "synthetic"
+    else:
+        from mopa.data import objective_dataset
+
+        dataset = objective_dataset(
+            n_eps=args.n_eps,
+            ckpt_seeds=checkpoint_seeds,
+            rng0=args.rollout_seed,
+            logdir=args.logdir,
+            prey_type=(
+                None if args.prey_objective == "matched" else args.prey_objective
+            ),
+        )
+        source = "mappo_checkpoints"
+
+    if args.dataset_cache is not None:
+        args.dataset_cache.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.dataset_cache, **dataset.as_dict())
+    return dataset, source
+
+
+def _validate_args(
+    args: argparse.Namespace,
+    checkpoint_seeds: tuple[int, ...],
+    encoder_seeds: tuple[int, ...],
+    bc_seeds: tuple[int, ...],
+    prefixes: tuple[int, ...],
+) -> None:
+    if args.n_eps < 1 or args.lat < 1 or args.hid < 1 or args.ctx < 1:
+        raise ValueError("n-eps, lat, hid, and ctx must be positive")
+    if args.encoder_steps < 0 or args.bc_steps < 0:
+        raise ValueError("training steps must be non-negative")
+    if not 0.0 < args.val_frac < 1.0:
+        raise ValueError("val-frac must be between zero and one")
+    if args.calibration_bins < 1:
+        raise ValueError("calibration-bins must be positive")
+    if args.dataset_cache is not None and args.dataset_cache.suffix != ".npz":
+        raise ValueError("dataset-cache must use a .npz suffix")
+    if not checkpoint_seeds or not encoder_seeds or not prefixes:
+        raise ValueError("checkpoint, encoder, and prefix lists must be non-empty")
+    if not args.skip_bc and not bc_seeds:
+        raise ValueError("bc-seeds must be non-empty unless --skip-bc is used")
+    if any(prefix < 1 for prefix in prefixes):
+        raise ValueError("prefixes must be positive")
+    for name, seeds in (
+        ("checkpoint", checkpoint_seeds),
+        ("encoder", encoder_seeds),
+        ("BC", bc_seeds),
+    ):
+        if len(seeds) != len(set(seeds)):
+            raise ValueError(f"{name} seeds must be unique")
+    if args.run_kind == "full" and not args.synthetic:
+        if args.split != "checkpoint":
+            raise ValueError("a full run requires --split checkpoint")
+        if args.prey_objective == "matched":
+            raise ValueError(
+                "a full run requires one fixed --prey-objective to avoid policy-ID leakage"
+            )
+        if args.dataset_cache is not None and args.dataset_cache.exists():
+            raise ValueError(
+                "a full run must generate fresh, checkpoint-bound rollouts; "
+                "dataset-cache may name a new output file only"
+            )
+        if len(checkpoint_seeds) < 3 or len(encoder_seeds) < 3:
+            raise ValueError(
+                "a full run requires at least three checkpoint and encoder seeds"
+            )
+        if args.skip_bc or len(bc_seeds) < 3:
+            raise ValueError(
+                "a full run requires BC and at least three distinct BC seeds"
+            )
+        if args.encoder_steps < 1 or args.bc_steps < 1:
+            raise ValueError("a full run requires positive encoder and BC steps")
+
+
+def _summary(values: list[float]) -> dict[str, Any]:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(array.mean()),
+        "std": float(array.std()),
+        "runs": [float(value) for value in array],
+    }
+
+
+def _environment_summary(
+    dataset: dict[str, np.ndarray],
+    episode_mask: np.ndarray,
+) -> dict[str, Any]:
+    """Summarize required behavior metrics by objective label."""
+    names = ("capture", "risk", "curious")
+    fields = {
+        "capture_rate": "captured",
+        "survival_time": "survival_time",
+        "resources_collected": "resources_collected",
+        "pred_lava_steps": "pred_lava_steps",
+        "prey_lava_steps": "prey_lava_steps",
+        "pred_coverage": "pred_coverage",
+    }
+    mask = np.asarray(episode_mask, dtype=bool)
+    if mask.shape != np.asarray(dataset["label"]).shape:
+        raise ValueError("environment summary mask must align with episodes")
+    output: dict[str, Any] = {}
+    for label, name in enumerate(names):
+        selected = mask & (np.asarray(dataset["label"]) == label)
+        if not np.any(selected):
+            raise ValueError(f"environment summary has no {name} episodes")
+        report: dict[str, Any] = {"n_episodes": int(selected.sum())}
+        for metric_name, field_name in fields.items():
+            values = np.asarray(dataset[field_name], dtype=np.float64)[selected]
+            report[metric_name] = {
+                "mean": float(values.mean()),
+                "std": float(values.std()),
+            }
+        output[name] = report
+    return output
+
+
+def _standardize_sequence_train_only(
+    sequence: np.ndarray,
+    lengths: np.ndarray,
+    train_idx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    valid = np.arange(sequence.shape[1])[None, :] < lengths[:, None]
+    train_values = sequence[train_idx][valid[train_idx]]
+    mu = train_values.mean(axis=0)
+    sd = train_values.std(axis=0) + 1e-6
+    scaled = ((sequence - mu) / sd).astype(np.float32)
+    scaled *= valid[..., None].astype(np.float32)
+    return scaled, mu.astype(np.float32), sd.astype(np.float32)
+
+
+def _score_latents(
+    z: np.ndarray,
+    labels: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    *,
+    seed: int,
+    calibration_bins: int,
+) -> dict[str, Any]:
+    from mopa.belief import fit_latent_belief
+    from mopa.encoders import collapse_diagnostics
+    from mopa.metrics import (
+        calibration_metrics,
+        train_only_metrics,
+        train_only_standardize,
+    )
+
+    scores = train_only_metrics(
+        z[train_idx],
+        labels[train_idx],
+        z[val_idx],
+        labels[val_idx],
+        n_classes=3,
+        seed=seed,
+    )
+    z_train, z_query, _, _ = train_only_standardize(
+        z[train_idx], z[val_idx]
+    )
+    belief = fit_latent_belief(z_train, labels[train_idx], z_query)
+    class_to_index = {int(label): i for i, label in enumerate(belief.classes)}
+    calibration_labels = np.asarray(
+        [class_to_index[int(label)] for label in labels[val_idx]], dtype=np.int32
+    )
+    return {
+        "seed": int(seed),
+        "probe": float(scores["probe"]),
+        "gmm_ari": float(scores["ari"]),
+        "collapse_train": collapse_diagnostics(z[train_idx]),
+        "collapse_heldout": collapse_diagnostics(z[val_idx]),
+        "calibration": calibration_metrics(
+            belief.probs, calibration_labels, n_bins=calibration_bins
+        ),
+    }
+
+
+def _aggregate_latent_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    calibration_names = ("nll", "brier", "ece", "classwise_ece")
+    return {
+        "heldout_probe": _summary([run["probe"] for run in runs]),
+        "heldout_gmm_ari": _summary([run["gmm_ari"] for run in runs]),
+        "collapse": [
+            {
+                "seed": run["seed"],
+                "train": run["collapse_train"],
+                "heldout": run["collapse_heldout"],
+            }
+            for run in runs
+        ],
+        "calibration": {
+            **{
+                name: _summary([run["calibration"][name] for run in runs])
+                for name in calibration_names
+            },
+            "reliability": [
+                {
+                    "seed": run["seed"],
+                    "bins": run["calibration"]["reliability"],
+                }
+                for run in runs
+            ],
+        },
+        "per_seed": [
+            {
+                "seed": run["seed"],
+                "probe": run["probe"],
+                "gmm_ari": run["gmm_ari"],
+            }
+            for run in runs
+        ],
+    }
+
+
+def _causal_sample_latents(
+    prefix_latents: np.ndarray,
+    episode_ids: np.ndarray,
+    timesteps: np.ndarray,
+) -> np.ndarray:
+    """Return the prefix latent available immediately before each action."""
+    z = np.asarray(prefix_latents)
+    episode_ids = np.asarray(episode_ids, dtype=np.int32)
+    timesteps = np.asarray(timesteps, dtype=np.int32)
+    if z.ndim != 3 or episode_ids.shape != timesteps.shape:
+        raise ValueError("prefix latents and sample provenance do not align")
+    if np.any(timesteps < 1):
+        raise ValueError("causal BC samples require timestep >= 1")
+    # Feature t - 1 ends at the state available for action t. Feature t would
+    # include the transition caused by the action being predicted.
+    latent_steps = np.clip(timesteps - 1, 0, z.shape[1] - 1)
+    return z[episode_ids, latent_steps]
+
+
+def _bc_summary(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "accuracy": _summary([run["accuracy"] for run in runs]),
+        "nll": _summary([run["nll"] for run in runs]),
+        "per_seed": runs,
+    }
+
+
+def _sequential_mixture_evaluation(
+    dataset: dict[str, np.ndarray],
+    validation_episodes: np.ndarray,
+    num_steps: int,
+    calibration_bins: int,
+) -> dict[str, Any]:
+    from mopa.bc import build_samples_with_time
+    from mopa.belief import categorical_entropy
+    from mopa.metrics import calibration_metrics
+    from mopa.strategy import SequentialOpponentModel, mixture_policy_metrics
+
+    states, actions, episodes, timesteps, predator_ids = build_samples_with_time(
+        dataset, ctx=1, t_max=num_steps
+    )
+    validation = validation_episodes[episodes]
+    if not np.any(validation) or not np.any(~validation):
+        raise ValueError(
+            "sequential evaluation needs valid actions in both train and validation"
+        )
+    model = SequentialOpponentModel.fit(
+        states[~validation],
+        actions[~validation],
+        dataset["label"][episodes[~validation]],
+        action_classes=np.arange(5, dtype=np.int32),
+    )
+
+    mixture_probabilities: list[np.ndarray] = []
+    oracle_probabilities: list[np.ndarray] = []
+    predictive_beliefs: list[np.ndarray] = []
+    posterior_beliefs: list[np.ndarray] = []
+    strategy_targets: list[np.ndarray] = []
+    observed_actions: list[np.ndarray] = []
+    class_to_index = {
+        int(label): index
+        for index, label in enumerate(model.policy.strategy_classes)
+    }
+    pairs = np.stack([episodes, predator_ids], axis=-1)
+    for episode, predator_id in np.unique(pairs[validation], axis=0):
+        rows = np.flatnonzero(
+            validation & (episodes == episode) & (predator_ids == predator_id)
+        )
+        rows = rows[np.argsort(timesteps[rows], kind="stable")]
+        trace = model.infer(states[rows], actions[rows])
+        mixture_probabilities.append(
+            model.mixture_probs(states[rows], trace.predictive)
+        )
+        label_index = class_to_index[int(dataset["label"][episode])]
+        one_hot = np.zeros_like(trace.predictive)
+        one_hot[:, label_index] = 1.0
+        oracle_probabilities.append(model.mixture_probs(states[rows], one_hot))
+        predictive_beliefs.append(trace.predictive)
+        posterior_beliefs.append(trace.probs)
+        strategy_targets.append(
+            np.full(len(rows), label_index, dtype=np.int32)
+        )
+        observed_actions.append(actions[rows])
+
+    probs = np.concatenate(mixture_probabilities, axis=0)
+    oracle_probs = np.concatenate(oracle_probabilities, axis=0)
+    predictive = np.concatenate(predictive_beliefs, axis=0)
+    posterior = np.concatenate(posterior_beliefs, axis=0)
+    strategy_target = np.concatenate(strategy_targets, axis=0)
+    acts = np.concatenate(observed_actions, axis=0)
+    result = mixture_policy_metrics(
+        probs, acts, action_classes=model.policy.action_classes
+    )
+    oracle_result = mixture_policy_metrics(
+        oracle_probs, acts, action_classes=model.policy.action_classes
+    )
+
+    def belief_report(probabilities: np.ndarray) -> dict[str, Any]:
+        report = calibration_metrics(
+            probabilities,
+            strategy_target,
+            n_bins=calibration_bins,
+        )
+        return {
+            "accuracy": float(
+                np.mean(np.argmax(probabilities, axis=-1) == strategy_target)
+            ),
+            "mean_entropy": float(categorical_entropy(probabilities).mean()),
+            "calibration": report,
+        }
+
+    return {
+        "top1": float(result["top1"]),
+        "nll": float(result["nll"]),
+        "oracle_strategy_top1": float(oracle_result["top1"]),
+        "oracle_strategy_nll": float(oracle_result["nll"]),
+        "predictive_strategy_belief": belief_report(predictive),
+        "posterior_strategy_belief": belief_report(posterior),
+        "strategy_classes": [
+            int(label) for label in model.policy.strategy_classes
+        ],
+        "n_actions": int(len(acts)),
+        "belief_timing": "predictive_before_observed_action",
+        "strategy_labels_at_inference": False,
+        "policy_fit_scope": "training_split_only",
+    }
+
+
+def _dry_run_manifest(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    checkpoints: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int]:
+    from mopa.manifest import build_manifest
+
+    missing = [checkpoint for checkpoint in checkpoints if not checkpoint["exists"]]
+    checks_ok = args.synthetic or not missing
+    manifest = build_manifest(
+        config=config,
+        checkpoints=checkpoints,
+        metrics={
+            "dry_run": True,
+            "checkpoints_ok": checks_ok,
+            "missing_count": len(missing),
+        },
+        split={"mode": args.split, "materialized": False},
+        stages={
+            "checkpoint_validation": {
+                "status": "smoke_passed" if checks_ok else "blocked",
+                "checks_passed": checks_ok,
+            },
+            "data": {"status": "not_run"},
+            "environment_evaluation": {"status": "not_run"},
+            "representations": {"status": "not_run"},
+            "evaluation": {"status": "not_run"},
+            "behaviour_cloning": {"status": "not_run"},
+            "cpl_preferences": {"status": "not_run"},
+        },
+        run_kind="dry_run",
+        cwd=_ROOT,
+    )
+    return manifest, 0 if checks_ok else 2
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    ckpt_seeds = _parse_ints(args.ckpt_seeds)
+    checkpoint_seeds = _parse_ints(args.ckpt_seeds)
     encoder_seeds = _parse_ints(args.encoder_seeds)
     bc_seeds = _parse_ints(args.bc_seeds)
+    prefixes = tuple(sorted(set(_parse_ints(args.prefixes))))
+    try:
+        _validate_args(args, checkpoint_seeds, encoder_seeds, bc_seeds, prefixes)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
 
-    from mopa.manifest import build_manifest, write_manifest
+    from mopa.manifest import build_manifest, file_sha256, git_dirty, write_manifest
 
-    config = {
+    # Synthetic data can validate plumbing, but can never make a full claim.
+    effective_run_kind = "smoke" if args.synthetic else args.run_kind
+    if effective_run_kind == "full" and git_dirty(_ROOT) is not False:
+        print(
+            "a full run requires a clean Git worktree for exact provenance",
+            file=sys.stderr,
+        )
+        return 2
+    config: dict[str, Any] = {
         "n_eps": args.n_eps,
-        "ckpt_seeds": list(ckpt_seeds),
+        "rollout_seed": args.rollout_seed,
+        "prey_objective": args.prey_objective,
+        "ckpt_seeds": list(checkpoint_seeds),
         "encoder_seeds": list(encoder_seeds),
         "bc_seeds": list(bc_seeds),
         "lat": args.lat,
         "ctx": args.ctx,
+        "prefixes": list(prefixes),
         "val_frac": args.val_frac,
         "split": args.split,
         "logdir": str(args.logdir),
         "encoder_steps": args.encoder_steps,
         "bc_steps": args.bc_steps,
         "hid": args.hid,
+        "calibration_bins": args.calibration_bins,
         "skip_bc": args.skip_bc,
+        "synthetic": args.synthetic,
+        "requested_run_kind": args.run_kind,
+        "effective_run_kind": effective_run_kind,
     }
-    checkpoints = _checkpoint_refs(args.logdir, ckpt_seeds)
-    missing = [c for c in checkpoints if not c["exists"]]
+    checkpoints = (
+        []
+        if args.synthetic
+        else _checkpoint_refs(
+            args.logdir, checkpoint_seeds, args.prey_objective
+        )
+    )
 
     if args.dry_run_checks:
-        metrics = {
-            "dry_run": True,
-            "checkpoints_ok": len(missing) == 0,
-            "missing_count": len(missing),
-        }
-        manifest = build_manifest(
-            config=config,
-            checkpoints=checkpoints,
-            metrics=metrics,
-            split={"mode": args.split},
-            cwd=_ROOT,
-        )
+        manifest, return_code = _dry_run_manifest(args, config, checkpoints)
         write_manifest(args.out, manifest)
         print(f"Wrote dry-run manifest to {args.out}")
-        return 0 if not missing else 2
+        return return_code
 
+    missing = [checkpoint for checkpoint in checkpoints if not checkpoint["exists"]]
     if missing:
-        print(f"Missing {len(missing)} checkpoint files under {args.logdir}", file=sys.stderr)
-        for c in missing[:6]:
-            print(f"  - {c['path']}", file=sys.stderr)
+        print(
+            f"Missing {len(missing)} checkpoint files under {args.logdir}",
+            file=sys.stderr,
+        )
+        for checkpoint in missing[:6]:
+            print(f"  - {checkpoint['path']}", file=sys.stderr)
         return 2
 
     import jax
 
-    from mopa.belief import fit_latent_belief
-    from mopa.data import objective_dataset
     from mopa.encoders import (
-        collapse_diagnostics,
+        encode_jepa,
         encode_jepa_gru,
+        encode_vae,
         gather_prefix_latents,
         train_jepa_gru_with_params,
+        train_jepa_with_params,
+        train_vae_with_params,
     )
-    from mopa.features import episode_lengths, predator_sequence_features, window
+    from mopa.features import (
+        episode_lengths,
+        length_matched_prefix,
+        predator_sequence_features,
+        sequence_slice,
+        trailing_sequence_slice,
+    )
     from mopa.metrics import (
-        expected_calibration_error,
-        survival_time_probe_acc,
-        train_only_metrics,
+        train_only_oracle_acc,
+        train_only_survival_time_probe_acc,
     )
     from mopa.splits import checkpoint_validation_mask, episode_validation_mask
 
-    if args.dataset_cache and args.dataset_cache.is_file():
-        raw = dict(np.load(args.dataset_cache, allow_pickle=False))
-        from mopa.types import ObjectiveDataset
+    dataset, dataset_source = _load_or_create_dataset(
+        args, checkpoint_seeds, prefixes
+    )
+    num_steps = int(dataset.pred_act.shape[1])
+    if args.ctx >= num_steps:
+        print("ctx must be smaller than the dataset horizon", file=sys.stderr)
+        return 2
+    labels = np.asarray(dataset.label, dtype=np.int32)
+    if set(np.unique(labels).tolist()) != {0, 1, 2}:
+        print("Part 1 requires strategy labels 0, 1, and 2", file=sys.stderr)
+        return 2
 
-        ds = ObjectiveDataset(**{k: raw[k] for k in ObjectiveDataset.__dataclass_fields__})
-    else:
-        ds = objective_dataset(
-            n_eps=args.n_eps,
-            ckpt_seeds=ckpt_seeds,
-            logdir=args.logdir,
-        )
-        if args.dataset_cache is not None:
-            args.dataset_cache.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(args.dataset_cache, **ds.as_dict())
-
-    num_steps = int(ds.pred_act.shape[1])
-    lengths = episode_lengths(ds.capture_t, num_steps)
-    X_seq = predator_sequence_features(ds.prey_pos, ds.pred_pos, lengths)
-
-    # Checkpoint-grouped holdout (default).
+    lengths = episode_lengths(dataset.capture_t, num_steps)
+    if not np.array_equal(lengths, np.asarray(dataset.valid_length)):
+        print("dataset valid_length does not match capture metadata", file=sys.stderr)
+        return 2
+    if np.asarray(dataset.env_seed).shape != (len(labels), 2):
+        print("dataset env_seed must store one JAX key per episode", file=sys.stderr)
+        return 2
+    sequence_raw = predator_sequence_features(
+        dataset.prey_pos, dataset.pred_pos, lengths
+    )
     if args.split == "checkpoint":
-        vmask = checkpoint_validation_mask(
-            ds.ckpt_seed, rng_seed=0, val_frac=args.val_frac
+        validation_episodes = checkpoint_validation_mask(
+            dataset.ckpt_seed, rng_seed=0, val_frac=args.val_frac
         )
     else:
-        ep_ids = np.arange(len(ds.label))
-        vmask = episode_validation_mask(ep_ids, rng_seed=0, val_frac=args.val_frac)
+        validation_episodes = episode_validation_mask(
+            np.arange(len(labels)), rng_seed=0, val_frac=args.val_frac
+        )
+    train_idx = np.flatnonzero(~validation_episodes)
+    val_idx = np.flatnonzero(validation_episodes)
+    if not len(train_idx) or not len(val_idx):
+        print("Empty train or validation split", file=sys.stderr)
+        return 2
+    if set(np.unique(labels[train_idx]).tolist()) != {0, 1, 2}:
+        print("Training split must contain all three strategies", file=sys.stderr)
+        return 2
+    if set(np.unique(labels[val_idx]).tolist()) != {0, 1, 2}:
+        print("Validation split must contain all three strategies", file=sys.stderr)
+        return 2
 
-    train_idx = np.where(~vmask)[0]
-    val_idx = np.where(vmask)[0]
-    if len(train_idx) == 0 or len(val_idx) == 0:
-        print("Empty train or val split", file=sys.stderr)
-        return 1
+    sequence, sequence_mu, sequence_sd = _standardize_sequence_train_only(
+        sequence_raw, lengths, train_idx
+    )
+    window_width = min(args.ctx, max(1, num_steps // 2))
+    comparison_lengths = length_matched_prefix(lengths, window_width)
+    context_raw = trailing_sequence_slice(
+        sequence, comparison_lengths, window_width
+    )
+    target_raw = sequence_slice(
+        sequence, window_width, window_width, lengths=lengths
+    )
+    jepa_train_idx = train_idx[
+        lengths[train_idx] >= 2 * window_width
+    ]
+    if not len(jepa_train_idx):
+        print(
+            "fixed-window JEPA needs training episodes with a full future target",
+            file=sys.stderr,
+        )
+        return 2
+    if set(np.unique(labels[jepa_train_idx]).tolist()) != {0, 1, 2}:
+        print(
+            "fixed-window JEPA needs full future targets for all three strategies",
+            file=sys.stderr,
+        )
+        return 2
+    common_train = np.concatenate(
+        [context_raw[train_idx], target_raw[jepa_train_idx]], axis=0
+    )
+    window_mu = common_train.mean(axis=0)
+    window_sd = common_train.std(axis=0) + 1e-6
+    context = ((context_raw - window_mu) / window_sd).astype(np.float32)
+    target = ((target_raw - window_mu) / window_sd).astype(np.float32)
 
-    # Train-only feature scale for window baselines / survival control context.
-    Xc_all = window(ds.prey_pos, min(args.ctx, num_steps), kmax=num_steps)
-    mu = Xc_all[train_idx].mean(0)
-    sd = Xc_all[train_idx].std(0) + 1e-6
-    Xc = ((Xc_all - mu) / sd).astype(np.float32)
-
-    probe_runs = []
-    ari_runs = []
-    collapse_runs = []
-    ece_runs = []
-    z_full_by_seed: dict[int, np.ndarray] = {}
+    model_names = (
+        "gru_jepa",
+        "fixed_window_jepa",
+        "beta_vae",
+        "random_projection",
+    )
+    representation_runs: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in model_names
+    }
+    anytime_runs: dict[str, dict[int, list[dict[str, Any]]]] = {
+        name: {prefix: [] for prefix in prefixes} for name in model_names
+    }
+    oracle_runs: list[float] = []
+    gru_prefix_latents: dict[int, np.ndarray] = {}
 
     for seed in encoder_seeds:
-        z, params, _ = train_jepa_gru_with_params(
-            X_seq[train_idx],
+        _, gru_params, _ = train_jepa_gru_with_params(
+            sequence[train_idx],
             lengths[train_idx],
             jax.random.PRNGKey(seed),
             lat=args.lat,
             hid=args.hid,
             steps=args.encoder_steps,
         )
-        # Frozen encode of the full pool with train-only params.
-        z_all = encode_jepa_gru(
-            params, X_seq, lengths, lat=args.lat, hid=args.hid
+        gru_all = encode_jepa_gru(
+            gru_params,
+            sequence,
+            lengths,
+            lat=args.lat,
+            hid=args.hid,
         )
-        z_ep = gather_prefix_latents(z_all, lengths)
-        z_full_by_seed[seed] = z_ep
-        m = train_only_metrics(
-            z_ep[train_idx],
-            ds.label[train_idx],
-            z_ep[val_idx],
-            ds.label[val_idx],
-            n_classes=3,
-            seed=seed,
+        gru_prefix_latents[seed] = gru_all
+
+        _, jepa_params = train_jepa_with_params(
+            context[jepa_train_idx],
+            target[jepa_train_idx],
+            jax.random.PRNGKey(10_000 + seed),
+            lat=args.lat,
+            steps=args.encoder_steps,
         )
-        probe_runs.append(m["probe"])
-        ari_runs.append(m["ari"])
-        collapse_runs.append(collapse_diagnostics(z_ep[train_idx]))
-        belief = fit_latent_belief(
-            z_ep[train_idx], ds.label[train_idx], z_ep[val_idx]
+        _, vae_params = train_vae_with_params(
+            context[train_idx],
+            jax.random.PRNGKey(20_000 + seed),
+            lat=args.lat,
+            steps=args.encoder_steps,
         )
-        ece_runs.append(
-            expected_calibration_error(belief.probs, ds.label[val_idx])
+        random = np.random.default_rng(30_000 + seed)
+        projection = random.normal(
+            size=(context.shape[1], args.lat)
+        ).astype(np.float32) / np.sqrt(context.shape[1])
+
+        full_latents = {
+            "gru_jepa": gather_prefix_latents(gru_all, comparison_lengths),
+            "fixed_window_jepa": encode_jepa(jepa_params, context, lat=args.lat),
+            "beta_vae": encode_vae(vae_params, context, lat=args.lat),
+            "random_projection": context @ projection,
+        }
+        for name, latent in full_latents.items():
+            representation_runs[name].append(
+                _score_latents(
+                    latent,
+                    labels,
+                    train_idx,
+                    val_idx,
+                    seed=seed,
+                    calibration_bins=args.calibration_bins,
+                )
+            )
+
+        oracle_runs.append(
+            train_only_oracle_acc(
+                context[train_idx],
+                labels[train_idx],
+                context[val_idx],
+                labels[val_idx],
+                hidden=max(8, args.hid),
+                seed=seed,
+            )
         )
 
-    survival_probe = survival_time_probe_acc(
-        ds.survival_time[val_idx], ds.label[val_idx], cv=min(3, len(val_idx))
-    )
-
-    metrics: dict = {
-        "heldout_probe_mean": float(np.mean(probe_runs)),
-        "heldout_probe_std": float(np.std(probe_runs)),
-        "heldout_probe_all": [float(x) for x in probe_runs],
-        "heldout_ari_mean": float(np.mean(ari_runs)),
-        "heldout_ari_std": float(np.std(ari_runs)),
-        "heldout_ece_mean": float(np.mean(ece_runs)),
-        "heldout_ece_std": float(np.std(ece_runs)),
-        "collapse": collapse_runs,
-        "survival_time_probe_control": float(survival_probe),
-        "window_context_dim": int(Xc.shape[1]),
-    }
-
-    if not args.skip_bc:
-        from mopa.bc import build_samples, train_eval_bc
-
-        # Use first encoder seed's full-episode z as point-latent baseline.
-        z0 = z_full_by_seed[encoder_seeds[0]]
-        S0, A, ep = build_samples(ds.as_dict(), args.ctx)
-        sample_groups = None
-        if args.split == "checkpoint":
-            sample_groups = np.asarray(ds.ckpt_seed, dtype=np.int32)[ep]
-
-        def _bc(name: str, S):
-            runs = []
-            for s in bc_seeds:
-                runs.append(
-                    train_eval_bc(
-                        S,
-                        A,
-                        ep,
-                        s,
-                        steps=args.bc_steps,
-                        group_ids=sample_groups,
+        for prefix in prefixes:
+            prefix_lengths = length_matched_prefix(lengths, min(prefix, num_steps))
+            prefix_context_raw = trailing_sequence_slice(
+                sequence,
+                prefix_lengths,
+                window_width,
+            )
+            prefix_context = (
+                (prefix_context_raw - window_mu) / window_sd
+            ).astype(np.float32)
+            prefix_latents = {
+                "gru_jepa": gather_prefix_latents(gru_all, prefix_lengths),
+                "fixed_window_jepa": encode_jepa(
+                    jepa_params, prefix_context, lat=args.lat
+                ),
+                "beta_vae": encode_vae(
+                    vae_params, prefix_context, lat=args.lat
+                ),
+                "random_projection": prefix_context @ projection,
+            }
+            for name, latent in prefix_latents.items():
+                anytime_runs[name][prefix].append(
+                    _score_latents(
+                        latent,
+                        labels,
+                        train_idx,
+                        val_idx,
+                        seed=seed,
+                        calibration_bins=args.calibration_bins,
                     )
                 )
-            return {
-                "mean": float(np.mean(runs)),
-                "std": float(np.std(runs)),
-                "runs": [float(x) for x in runs],
-                "baseline": name == "z",
-                "label": (
-                    "point-latent BC baseline (not belief mixture)"
-                    if name == "z"
-                    else "unconditioned BC"
+
+    representations = {
+        name: {
+            **_aggregate_latent_runs(runs),
+            "training_scope": "train_fold_only",
+            "heldout_encoding": "frozen",
+            "feature_schema": "predator_sequence_features",
+            "comparison_prefix": int(window_width),
+        }
+        for name, runs in representation_runs.items()
+    }
+    representations["supervised_oracle"] = {
+        "heldout_accuracy": _summary(oracle_runs),
+        "training_scope": "train_fold_only",
+        "uses_strategy_labels": True,
+        "feature_schema": "predator_sequence_features/fixed_window",
+    }
+    anytime: dict[str, Any] = {
+        "requested_prefixes": list(prefixes),
+        "prefix_semantics": "length_matched",
+    }
+    for name in model_names:
+        anytime[name] = {
+            str(prefix): {
+                **_aggregate_latent_runs(anytime_runs[name][prefix]),
+                "effective_steps": int(
+                    min(prefix, num_steps)
+                    if name == "gru_jepa"
+                    else min(prefix, num_steps, window_width)
                 ),
             }
+            for prefix in prefixes
+        }
 
+    survival_probe = train_only_survival_time_probe_acc(
+        dataset.survival_time[train_idx],
+        labels[train_idx],
+        dataset.survival_time[val_idx],
+        labels[val_idx],
+    )
+    metrics: dict[str, Any] = {
+        "representations": representations,
+        "anytime": anytime,
+        "controls": {"survival_time_heldout_probe": float(survival_probe)},
+    }
+
+    dataset_dict = dataset.as_dict()
+    metrics["environment"] = {
+        "all": _environment_summary(
+            dataset_dict, np.ones(len(labels), dtype=bool)
+        ),
+        "heldout": _environment_summary(dataset_dict, validation_episodes),
+    }
+    metrics["sequential_belief_mixture"] = _sequential_mixture_evaluation(
+        dataset_dict,
+        validation_episodes,
+        num_steps,
+        args.calibration_bins,
+    )
+
+    if args.skip_bc:
+        metrics["bc"] = {"skipped": True}
+    else:
+        from mopa.bc import build_samples_with_time, train_eval_bc_metrics
+
+        states, actions, episodes, timesteps, _ = build_samples_with_time(
+            dataset_dict, args.ctx, t_max=num_steps
+        )
+        sample_validation = validation_episodes[episodes]
+        unconditioned_runs: list[dict[str, Any]] = []
+        for bc_seed in bc_seeds:
+            run = train_eval_bc_metrics(
+                states,
+                actions,
+                episodes,
+                bc_seed,
+                steps=args.bc_steps,
+                validation_mask=sample_validation,
+            )
+            unconditioned_runs.append({"bc_seed": int(bc_seed), **run})
+
+        point_latent_runs: list[dict[str, Any]] = []
+        for encoder_seed in encoder_seeds:
+            causal_z = _causal_sample_latents(
+                gru_prefix_latents[encoder_seed], episodes, timesteps
+            )
+            conditioned_states = np.concatenate([states, causal_z], axis=-1)
+            for bc_seed in bc_seeds:
+                run = train_eval_bc_metrics(
+                    conditioned_states,
+                    actions,
+                    episodes,
+                    bc_seed,
+                    steps=args.bc_steps,
+                    validation_mask=sample_validation,
+                )
+                point_latent_runs.append(
+                    {
+                        "encoder_seed": int(encoder_seed),
+                        "bc_seed": int(bc_seed),
+                        **run,
+                    }
+                )
+
+        split_digest = hashlib.sha256(
+            np.asarray(sample_validation, dtype=np.uint8).tobytes()
+        ).hexdigest()
         metrics["bc"] = {
-            "none": _bc("none", S0),
-            "z": _bc("z", np.concatenate([S0, z0[ep]], -1)),
+            "unconditioned": _bc_summary(unconditioned_runs),
+            "point_z": {
+                **_bc_summary(point_latent_runs),
+                "conditioning": "gru_prefix_latent_at_t_minus_1",
+                "contains_future_episode_information": False,
+            },
+            "shared_validation_mask_sha256": split_digest,
+            "split_source": "manifest_episode_split_broadcast_to_samples",
         }
 
     split_info = {
         "mode": args.split,
+        "seed": 0,
+        "val_frac": args.val_frac,
         "n_train": int(len(train_idx)),
         "n_val": int(len(val_idx)),
-        "val_ckpt_seeds": sorted(
-            {int(x) for x in np.unique(ds.ckpt_seed[val_idx])}
-        )
-        if args.split == "checkpoint"
-        else [],
         "train_ckpt_seeds": sorted(
-            {int(x) for x in np.unique(ds.ckpt_seed[train_idx])}
-        )
-        if args.split == "checkpoint"
-        else [],
+            int(value) for value in np.unique(dataset.ckpt_seed[train_idx])
+        ),
+        "val_ckpt_seeds": sorted(
+            int(value) for value in np.unique(dataset.ckpt_seed[val_idx])
+        ),
+        "shared_across_encoder_and_bc_seeds": True,
+        "episodes": [
+            {
+                "index": int(index),
+                "fold": "validation" if validation_episodes[index] else "train",
+                "strategy_label": int(dataset.label[index]),
+                "checkpoint_seed": int(dataset.ckpt_seed[index]),
+                "environment_key": [
+                    int(value) for value in dataset.env_seed[index]
+                ],
+                "valid_length": int(dataset.valid_length[index]),
+            }
+            for index in range(len(labels))
+        ],
     }
+    status = (
+        "full_run_finished"
+        if effective_run_kind == "full"
+        else "smoke_passed"
+    )
+    stages = {
+        "data": {"status": status, "source": dataset_source},
+        "environment_evaluation": {"status": status},
+        "representations": {"status": status},
+        "anytime_and_calibration": {"status": status},
+        "sequential_belief_mixture": {"status": status},
+        "behaviour_cloning": {
+            "status": "not_run" if args.skip_bc else status
+        },
+        "cpl_preferences": {
+            "status": "not_run",
+            "reason": "requires a real planner-generated preference dataset",
+        },
+    }
+    artifacts: list[dict[str, Any]] = []
+    if args.dataset_cache is not None and args.dataset_cache.is_file():
+        artifacts.append(
+            {
+                "kind": "dataset_cache",
+                "path": str(args.dataset_cache),
+                "sha256": file_sha256(args.dataset_cache),
+            }
+        )
+    notes = [
+        "Strategy labels are evaluation targets and supervised-oracle/policy-fit labels; they are not SSL encoder inputs.",
+        "All learned encoders fit on the training fold and encode held-out episodes with frozen parameters.",
+        "Point-z BC uses the prefix latent available before each action, never a full-episode latent.",
+        "The sequential mixture scores each action with the predictive belief before that action is observed.",
+        "A dry or smoke run is infrastructure evidence, not a full experiment result.",
+        "full_run_finished records execution only; scientific adequacy still depends on the declared protocol and success criteria.",
+    ]
+    if args.synthetic:
+        notes.append(
+            "Synthetic data are a deterministic infrastructure smoke test and cannot support empirical claims."
+        )
+    if args.synthetic and args.run_kind == "full":
+        notes.append("Requested full status was downgraded to smoke for synthetic data.")
 
     manifest = build_manifest(
-        config=config,
+        config={
+            **config,
+            "num_steps": num_steps,
+            "window_width": window_width,
+            "comparison_prefix": window_width,
+            "window_jepa_train_episodes": int(len(jepa_train_idx)),
+            "window_jepa_target_requirement": "valid_length_at_least_2x_window",
+            "sequence_feature_dim": int(sequence.shape[-1]),
+            "sequence_train_mean": [float(value) for value in sequence_mu],
+            "sequence_train_std": [float(value) for value in sequence_sd],
+        },
         checkpoints=checkpoints,
         metrics=metrics,
         split=split_info,
+        stages=stages,
+        artifacts=artifacts,
+        run_kind=effective_run_kind,
+        notes=notes,
         cwd=_ROOT,
     )
     write_manifest(args.out, manifest)
+    primary = metrics["representations"]["gru_jepa"]["heldout_probe"]
     print(
-        f"held-out probe {metrics['heldout_probe_mean']:.3f} "
-        f"+/- {metrics['heldout_probe_std']:.3f} "
-        f"(survival control {metrics['survival_time_probe_control']:.3f})"
+        f"GRU-JEPA held-out probe {primary['mean']:.3f} +/- {primary['std']:.3f}"
     )
-    print(f"Wrote manifest to {args.out}")
+    print(f"Wrote {effective_run_kind} manifest to {args.out}")
     return 0
 
 

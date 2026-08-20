@@ -20,7 +20,7 @@ from flax.linen.initializers import orthogonal
 from numpy.typing import NDArray
 
 from mopa.features import EP_LEN
-from mopa.samples import build_predator_samples
+from mopa.samples import build_predator_samples, build_predator_samples_with_time
 from mopa.splits import episode_validation_mask, group_validation_mask
 from mopa.types import BCRunStats
 
@@ -39,7 +39,9 @@ __all__ = [
     "BC_STEPS",
     "bc_comparison",
     "build_samples",
+    "build_samples_with_time",
     "train_eval_bc",
+    "train_eval_bc_metrics",
 ]
 
 
@@ -75,6 +77,21 @@ def build_samples(
     )
 
 
+def build_samples_with_time(
+    ds: Mapping[str, np.ndarray],
+    ctx: int,
+    ep_len: int = EP_LEN,
+    t_max: int | None = None,
+) -> tuple[Arrayf, Arrayi, Arrayi, Arrayi, Arrayi]:
+    """Build samples plus ``(timestep, predator_id)`` causal provenance."""
+    if t_max is None:
+        t_max = min(ep_len, int(ds["pred_act"].shape[1]))
+    capture_t = ds["capture_t"] if "capture_t" in ds else None
+    return build_predator_samples_with_time(
+        dict(ds), ctx, t_max, ep_len=ep_len, capture_t=capture_t
+    )
+
+
 def train_eval_bc(
     S: Arrayf,
     A: Arrayi,
@@ -84,6 +101,7 @@ def train_eval_bc(
     steps: int = BC_STEPS,
     group_ids: Arrayi | None = None,
     split_seed: int | None = None,
+    validation_mask: NDArray[np.bool_] | None = None,
 ) -> float:
     """Train a BC net and return held-out action accuracy.
 
@@ -91,14 +109,56 @@ def train_eval_bc(
     checkpoint seeds broadcast to sample rows), holds out whole groups.
     ``split_seed`` defaults to ``rng_seed`` for backward compatibility.
     """
-    split_rng = rng_seed if split_seed is None else split_seed
-    if group_ids is None:
-        vmask = episode_validation_mask(ep, rng_seed=split_rng, val_frac=val_frac)
+    return float(
+        train_eval_bc_metrics(
+            S,
+            A,
+            ep,
+            rng_seed,
+            val_frac=val_frac,
+            steps=steps,
+            group_ids=group_ids,
+            split_seed=split_seed,
+            validation_mask=validation_mask,
+        )["accuracy"]
+    )
+
+
+def train_eval_bc_metrics(
+    S: Arrayf,
+    A: Arrayi,
+    ep: Arrayi,
+    rng_seed: int,
+    val_frac: float = 0.2,
+    steps: int = BC_STEPS,
+    group_ids: Arrayi | None = None,
+    split_seed: int | None = None,
+    validation_mask: NDArray[np.bool_] | None = None,
+) -> dict[str, float | int]:
+    """Train BC once and return held-out accuracy and action NLL.
+
+    ``validation_mask`` is the preferred experiment-driver interface: it is a
+    sample-aligned mask derived from the single manifest split and therefore
+    stays identical across model initialization seeds.  The legacy split
+    arguments remain for small standalone calls.
+    """
+    if validation_mask is not None:
+        vmask = np.asarray(validation_mask, dtype=bool)
+        if vmask.shape != (len(ep),):
+            raise ValueError("validation_mask must align with samples")
     else:
-        if len(group_ids) != len(ep):
-            raise ValueError("group_ids must align with samples")
-        vmask = group_validation_mask(group_ids, rng_seed=split_rng, val_frac=val_frac)
+        split_rng = rng_seed if split_seed is None else split_seed
+        if group_ids is None:
+            vmask = episode_validation_mask(ep, rng_seed=split_rng, val_frac=val_frac)
+        else:
+            if len(group_ids) != len(ep):
+                raise ValueError("group_ids must align with samples")
+            vmask = group_validation_mask(
+                group_ids, rng_seed=split_rng, val_frac=val_frac
+            )
     Str, Atr, Sva, Ava = S[~vmask], A[~vmask], S[vmask], A[vmask]
+    if len(Str) == 0 or len(Sva) == 0:
+        raise ValueError("BC split must contain both train and validation samples")
 
     mu, sd = Str.mean(0), Str.std(0) + 1e-6
     Str, Sva = (Str - mu) / sd, (Sva - mu) / sd
@@ -127,8 +187,17 @@ def train_eval_bc(
         idx = jax.random.choice(bk, n, (min(BC_BATCH, n),), replace=False)
         params, opt = upd(params, opt, idx)
 
-    pred = np.asarray(net.apply(params, jnp.asarray(Sva))).argmax(-1)
-    return float((pred == Ava).mean())
+    logits = np.asarray(net.apply(params, jnp.asarray(Sva)), dtype=np.float32)
+    pred = logits.argmax(-1)
+    shifted = logits - logits.max(axis=-1, keepdims=True)
+    log_probs = shifted - np.log(np.exp(shifted).sum(axis=-1, keepdims=True))
+    nll = -float(log_probs[np.arange(len(Ava)), Ava].mean())
+    return {
+        "accuracy": float((pred == Ava).mean()),
+        "nll": nll,
+        "n_train": int(len(Str)),
+        "n_val": int(len(Sva)),
+    }
 
 
 def bc_comparison(
@@ -138,6 +207,7 @@ def bc_comparison(
     seeds: Sequence[int] = (0, 1, 2),
     group_ids: Arrayi | None = None,
     split: str = "episode",
+    split_seed: int = 0,
 ) -> dict[str, BCRunStats]:
     """Run BC for each conditioning variant.
 
@@ -167,7 +237,15 @@ def bc_comparison(
             # so val episodes never influence feature scale.
             S = np.concatenate([S0, np.asarray(z, dtype=np.float32)[ep]], -1)
         runs = tuple(
-            train_eval_bc(S, A, ep, s, group_ids=sample_groups) for s in seeds
+            train_eval_bc(
+                S,
+                A,
+                ep,
+                s,
+                group_ids=sample_groups,
+                split_seed=split_seed,
+            )
+            for s in seeds
         )
         v = np.asarray(runs)
         results[name] = BCRunStats(mean=float(v.mean()), std=float(v.std()), runs=runs)
