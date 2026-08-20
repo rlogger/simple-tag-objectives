@@ -1,51 +1,119 @@
 # opponent-modeling
 
+Objective-typed multi-agent reinforcement learning plus a compact,
+uncertainty-aware opponent-modeling pipeline. The repository includes:
+
+- capture, risk-averse, and curious predator objectives;
+- MAPPO specialist training and capture-aware rollouts;
+- variable-length GRU-JEPA, fixed-window JEPA, beta-VAE, random, and supervised
+  controls;
+- online Bayesian strategy beliefs and belief-mixture action prediction;
+- causal latent-conditioned behavior cloning; and
+- validated replay, counterfactual, and CPL foundations for a future planner.
+
+The code is runnable, but the repository contains no full checkpoints or
+scientific result artifacts. See [docs/STATUS.md](docs/STATUS.md) for the exact
+implementation and evidence boundary.
+
 ## Install
 
+Use Python 3.11 or 3.12 and the checked-in lockfile:
+
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e /path/to/JaxMARL
-pip install -e ".[dev,train]"
+export UV_PROJECT_ENVIRONMENT=venv
+uv sync --locked --all-extras
 ```
 
-## Environment quick start
+The lock pins the tested JaxMARL/JAX/Distrax combination; no separate JaxMARL
+checkout is required. The explicit non-hidden environment path also keeps
+editable package imports reliable on macOS. Keep `UV_PROJECT_ENVIRONMENT`
+exported while running the repository commands below.
 
-```python
-import jax
-from tag_objectives import make_env, evaluate_policy, random_policy
+## Verify the repository
 
-env = make_env("curious")
-metrics = evaluate_policy(
-    env, random_policy(env), n_eps=64, key=jax.random.PRNGKey(0)
-)
-print(metrics.means())
+```bash
+uv run ruff check .
+uv run pytest -q
 ```
+
+Run the deterministic end-to-end infrastructure smoke without checkpoints:
+
+```bash
+uv run python scripts/run_part1.py \
+  --synthetic \
+  --n-eps 3 \
+  --ckpt-seeds 0,1 \
+  --encoder-seeds 0 \
+  --bc-seeds 0 \
+  --ctx 2 \
+  --prefixes 2,4 \
+  --hid 8 \
+  --encoder-steps 1 \
+  --bc-steps 1 \
+  --out artifacts/part1_synthetic.json
+```
+
+This writes a schema-v2 smoke manifest. It tests plumbing only and is not an
+experiment result.
 
 ## Train MAPPO specialists
 
 ```bash
-python scripts/train_mappo.py alg=mappo_objectives_capture NUM_SEEDS=3
-python scripts/train_mappo.py alg=mappo_objectives_risk NUM_SEEDS=3
-python scripts/train_mappo.py alg=mappo_objectives_curious NUM_SEEDS=3
+uv run python scripts/train_mappo.py alg=mappo_objectives_capture NUM_SEEDS=3
+uv run python scripts/train_mappo.py alg=mappo_objectives_risk NUM_SEEDS=3
+uv run python scripts/train_mappo.py alg=mappo_objectives_curious NUM_SEEDS=3
 ```
 
-Checkpoints land under `logs/MPE_simple_tag_v3/`.
+Actor checkpoints are written under `logs/MPE_simple_tag_v3/`. Validate the
+expected three-seed checkpoint set before a real pipeline run:
+
+```bash
+uv run python scripts/run_part1.py \
+  --dry-run-checks \
+  --prey-objective capture \
+  --out artifacts/part1_dry.json
+```
+
+The reference protocol holds out whole checkpoint seeds and uses one fixed prey
+checkpoint family across all predator objectives. This prevents the strategy
+label from merely identifying three separately co-trained prey policies.
+
+## Run the real pipeline
+
+Start with `--run-kind smoke` and small declared budgets. A full execution must
+use a clean committed worktree, a fixed prey objective, fresh rollouts, a
+checkpoint-held-out split, and at least three distinct checkpoint, encoder, and
+BC seeds:
+
+```bash
+N_EPISODES=...
+ENCODER_STEPS=...
+BC_STEPS=...
+uv run python scripts/run_part1.py \
+  --run-kind full \
+  --prey-objective capture \
+  --n-eps "$N_EPISODES" \
+  --encoder-steps "$ENCODER_STEPS" \
+  --bc-steps "$BC_STEPS" \
+  --dataset-cache artifacts/part1_rollouts.npz \
+  --out artifacts/part1_full.json
+```
+
+The source documents do not settle the full budgets or scientific success
+thresholds. Accordingly, a successful full execution is recorded as
+`full_run_finished`, not as proof of strategy recovery or robustness.
 
 ## Layout
 
 ```text
-src/tag_objectives/   # env
-src/mopa/             # Part 1: encoders, belief, bc, data, metrics
-scripts/train_mappo.py
-scripts/run_part1.py
-configs/alg/mappo_objectives_{capture,risk,curious}.yaml
-docs/{ENVIRONMENT,PART1,PART1_GUIDELINES}.md
-tests/
+src/tag_objectives/   objective-typed environment and evaluation
+src/mopa/             rollouts, encoders, beliefs, policies, BC, CPL, manifests
+scripts/              MAPPO training and the end-to-end Part 1 driver
+configs/alg/          capture, risk, and curious MAPPO configurations
+docs/                 environment, pipeline, protocol, and status
+tests/                unit, regression, synthetic pipeline, and env tests
+.github/workflows/    locked lint, test, and MAPPO smoke CI
 ```
 
-## Test
-
-```bash
-PYTHONPATH=src pytest -q
-```
+Read [docs/PART1.md](docs/PART1.md) for the model/data flow and
+[docs/PART1_GUIDELINES.md](docs/PART1_GUIDELINES.md) for the claim rules.

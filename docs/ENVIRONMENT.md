@@ -12,10 +12,10 @@ The prey collects resources (+5 each); predators cannot see resources. Both
 sides observe the 3 nearest lava discs `(dx, dy, radius)`; the prey also sees
 its 10 nearest uncollected resources `(dx, dy)`.
 
-At the v5 defaults, lava is -100/step for the risk-averse predator and 0 for
+At the current defaults, lava is -100/step for the risk-averse predator and 0 for
 every other agent (`lava_penalty=100`, `base_lava_penalty=0`,
 `prey_lava_penalty=0`). The episode ends at the first capture (any predator)
-or at 100 steps; survival time to first capture is the headline metric.
+or at 100 steps; survival time to first capture is a primary behavior metric.
 
 ## Extension point 1: new predator objectives
 
@@ -37,7 +37,7 @@ register_objective("guard", lambda env: guard_reward)
 `ctx` channels: `capture_f`, `dist`, `in_lava`, `new_cell`, `pred_pos`,
 `prey_pos`, `prey_lava`, `state`, `new_state`.
 
-| name | reward per step (v5 defaults) |
+| name | reward per step (current defaults) |
 |------|-------------------------------|
 | `capture` | `-dist_i` |
 | `risk` | `+10*capture - 100*in_lava_i - dense_chase_coef*dist_i` |
