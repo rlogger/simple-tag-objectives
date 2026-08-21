@@ -11,10 +11,6 @@ uncertainty-aware opponent-modeling pipeline. The repository includes:
 - causal latent-conditioned behavior cloning; and
 - validated replay, counterfactual, and CPL foundations for a future planner.
 
-The code is runnable, but the repository contains no full checkpoints or
-scientific result artifacts. See [docs/STATUS.md](docs/STATUS.md) for the exact
-implementation and evidence boundary.
-
 ## Install
 
 Use Python 3.11 or 3.12 and the checked-in lockfile:
